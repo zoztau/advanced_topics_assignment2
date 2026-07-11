@@ -1,0 +1,9 @@
+simulation_compositions:
+  simulations:
+    - simulation_config: simulation/simulation.yaml
+      mission_configs:
+        - mission/mission.yaml
+  drone_configs:
+    - drone/drone.yaml
+  lidar_configs:
+    - lidar/lidar.yaml

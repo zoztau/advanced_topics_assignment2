@@ -1,0 +1,12 @@
+simulation_config:
+  map_filename: "mines_of_moria/map_input.npy"
+  map_resolution_cm: 20
+  initial_drone_position:
+    x_cm: 250
+    y_cm: 250
+    height_cm: 250
+  initial_angle_deg: 0
+  map_axes_offset:
+    x_offset: 0
+    y_offset: 0
+    height_offset: 0

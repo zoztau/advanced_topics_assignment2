@@ -1,0 +1,12 @@
+simulation_config:
+  map_filename: "new_york/map_input.npy"
+  map_resolution_cm: 20
+  initial_drone_position:
+    x_cm: 310
+    y_cm: 410
+    height_cm: 310
+  initial_angle_deg: 0
+  map_axes_offset:
+    x_offset: 0
+    y_offset: 0
+    height_offset: 0

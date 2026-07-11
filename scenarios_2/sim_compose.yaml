@@ -1,0 +1,17 @@
+simulation_compositions:
+  simulations:
+    - simulation_config: "simulation/enies_lobby.yaml"
+      mission_configs:
+        - "mission/enies_lobby.yaml"
+    - simulation_config: "simulation/mines_of_moria.yaml"
+      mission_configs:
+        - "mission/mines_of_moria.yaml"
+    - simulation_config: "simulation/new_york.yaml"
+      mission_configs:
+        - "mission/new_york.yaml"
+
+  drone_configs:
+    - "drone/assignment1_drone.yaml"
+
+  lidar_configs:
+    - "lidar/assignment1_lidar.yaml"
