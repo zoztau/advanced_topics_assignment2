@@ -427,6 +427,58 @@ TEST(DroneControl, NaturallyFinishedAlgorithmProducesCompleted) {
     EXPECT_EQ(lidar.scan_calls, 0);
 }
 
+TEST(MockMovement, RejectsSmallSphereOverlappingAdjacentOccupiedVoxel) {
+    const types::MapConfig config = mapConfig(bounds(0.0, 40.0, 0.0, 40.0, 0.0, 40.0), 10.0);
+    auto hidden = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Empty);
+    hidden->set(pos(15.0, 15.0, 15.0), types::VoxelOccupancy::Occupied);
+    MockGPS gps{pos(5.0, 15.0, 15.0), makeHeading(0.0), 10.0 * cm};
+    MockMovement movement{gps, *hidden, 2.0 * cm};
+
+    const types::MovementResult result = movement.advance(3.5 * cm);
+
+    EXPECT_FALSE(result.success);
+    EXPECT_DOUBLE_EQ(gps.position().x.force_numerical_value_in(cm), 5.0);
+}
+
+TEST(MockMovement, RejectsSmallSphereTangentToAdjacentOccupiedVoxel) {
+    const types::MapConfig config = mapConfig(bounds(0.0, 40.0, 0.0, 40.0, 0.0, 40.0), 10.0);
+    auto hidden = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Empty);
+    hidden->set(pos(15.0, 15.0, 15.0), types::VoxelOccupancy::Occupied);
+    MockGPS gps{pos(5.0, 15.0, 15.0), makeHeading(0.0), 10.0 * cm};
+    MockMovement movement{gps, *hidden, 2.0 * cm};
+
+    const types::MovementResult result = movement.advance(3.0 * cm);
+
+    EXPECT_FALSE(result.success);
+    EXPECT_DOUBLE_EQ(gps.position().x.force_numerical_value_in(cm), 5.0);
+}
+
+TEST(MockMovement, AcceptsSmallSphereWhenNeighboringVoxelsAreClear) {
+    const types::MapConfig config = mapConfig(bounds(0.0, 40.0, 0.0, 40.0, 0.0, 40.0), 10.0);
+    auto hidden = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Empty);
+    MockGPS gps{pos(5.0, 15.0, 15.0), makeHeading(0.0), 10.0 * cm};
+    MockMovement movement{gps, *hidden, 2.0 * cm};
+
+    const types::MovementResult result = movement.advance(3.5 * cm);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_DOUBLE_EQ(gps.position().x.force_numerical_value_in(cm), 8.5);
+}
+
+TEST(MockMovement, RejectsSmallSphereSweptThroughOccupiedVoxel) {
+    const types::MapConfig config = mapConfig(bounds(0.0, 40.0, 0.0, 40.0, 0.0, 40.0), 10.0);
+    auto hidden = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Empty);
+    hidden->set(pos(15.0, 15.0, 15.0), types::VoxelOccupancy::Occupied);
+    MockGPS gps{pos(7.9, 11.0, 15.0), makeHeading(-45.0), 10.0 * cm};
+    MockMovement movement{gps, *hidden, 2.0 * cm};
+
+    const types::MovementResult result = movement.advance(3.1 * std::sqrt(2.0) * cm);
+
+    EXPECT_FALSE(result.success);
+    EXPECT_DOUBLE_EQ(gps.position().x.force_numerical_value_in(cm), 7.9);
+    EXPECT_DOUBLE_EQ(gps.position().y.force_numerical_value_in(cm), 11.0);
+}
+
 TEST(MappingAlgorithm, DoesNotClaimCompletionAtMissionStepLimit) {
     const types::MapConfig config = mapConfig(bounds(0.0, 20.0, 0.0, 20.0, 0.0, 20.0), 10.0);
     auto output = Map3DImpl::createEmpty(config);

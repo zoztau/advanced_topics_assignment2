@@ -2,6 +2,8 @@
 
 #include <drone_mapper/IMap3D.h>
 
+#include <geometry/VoxelGeometry.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -179,26 +181,6 @@ constexpr double kMinimumUsefulPotentialFraction = 0.05;
     };
 }
 
-[[nodiscard]] double squaredDistanceToCellAabb(const Position3D& position,
-                                               const MappingAlgorithmImpl::GridIndex& index,
-                                               const types::MapConfig& config) {
-    const double resolution = lengthCm(config.resolution);
-    const double x_min = xCm(config.boundaries.min_x) + static_cast<double>(index.x) * resolution;
-    const double y_min = yCm(config.boundaries.min_y) + static_cast<double>(index.y) * resolution;
-    const double z_min = zCm(config.boundaries.min_height) + static_cast<double>(index.z) * resolution;
-    const double x_max = x_min + resolution;
-    const double y_max = y_min + resolution;
-    const double z_max = z_min + resolution;
-
-    const double x = xCm(position.x);
-    const double y = yCm(position.y);
-    const double z = zCm(position.z);
-    const double dx = x < x_min ? x_min - x : (x > x_max ? x - x_max : 0.0);
-    const double dy = y < y_min ? y_min - y : (y > y_max ? y - y_max : 0.0);
-    const double dz = z < z_min ? z_min - z : (z > z_max ? z - z_max : 0.0);
-    return dx * dx + dy * dy + dz * dz;
-}
-
 } // namespace
 
 bool MappingAlgorithmImpl::usesLeanScanPattern() const {
@@ -307,14 +289,16 @@ MappingAlgorithmImpl::SafetyAnalysis MappingAlgorithmImpl::analyzeKnownSafety(
             for (int dz = -cell_radius; dz <= cell_radius; ++dz) {
                 const GridIndex check{index.x + dx, index.y + dy, index.z + dz};
                 if (!inGrid(check)) {
-                    if (squaredDistanceToCellAabb(center, check, config) <= radius * radius + kEpsilon) {
+                    if (geometry::squaredDistanceToVoxelAabb(
+                            center, check.x, check.y, check.z, config) <= radius * radius + kEpsilon) {
                         analysis.hard_blocked = true;
                         return analysis;
                     }
                     continue;
                 }
 
-                if (squaredDistanceToCellAabb(center, check, config) > radius * radius + kEpsilon) {
+                if (geometry::squaredDistanceToVoxelAabb(
+                        center, check.x, check.y, check.z, config) > radius * radius + kEpsilon) {
                     continue;
                 }
 
@@ -894,12 +878,15 @@ std::optional<MappingAlgorithmImpl::ScanPlan> MappingAlgorithmImpl::nextScanPlan
         std::vector<GridIndex> blockers = analysis.unresolved;
         std::stable_sort(blockers.begin(), blockers.end(), [&](const GridIndex& left_blocker,
                                                                const GridIndex& right_blocker) {
-            return squaredDistanceToCellAabb(state.position, left_blocker, config) <
-                   squaredDistanceToCellAabb(state.position, right_blocker, config);
+            return geometry::squaredDistanceToVoxelAabb(
+                       state.position, left_blocker.x, left_blocker.y, left_blocker.z, config) <
+                   geometry::squaredDistanceToVoxelAabb(
+                       state.position, right_blocker.x, right_blocker.y, right_blocker.z, config);
         });
 
         for (const GridIndex& blocker : blockers) {
-            if (squaredDistanceToCellAabb(state.position, blocker, config) >
+            if (geometry::squaredDistanceToVoxelAabb(
+                    state.position, blocker.x, blocker.y, blocker.z, config) >
                 lidar_range_squared + kEpsilon) {
                 continue;
             }

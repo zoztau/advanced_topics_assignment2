@@ -2,6 +2,8 @@
 
 #include <drone_mapper/IMap3D.h>
 
+#include <geometry/VoxelGeometry.h>
+
 #include <mp-units/systems/si/math.h>
 
 #include <algorithm>
@@ -10,6 +12,17 @@
 
 namespace drone_mapper {
 namespace {
+
+constexpr double kCollisionEpsilon = 1.0e-6;
+
+struct AxisIndexRange {
+    int first = 1;
+    int last = 0;
+
+    [[nodiscard]] bool empty() const {
+        return first > last;
+    }
+};
 
 [[nodiscard]] double xCm(XLength value) {
     return value.force_numerical_value_in(cm);
@@ -35,13 +48,61 @@ namespace {
     return occupancy != types::VoxelOccupancy::Empty;
 }
 
-[[nodiscard]] Position3D interpolatedPosition(const Position3D& from,
-                                              const Position3D& to,
-                                              double t) {
+[[nodiscard]] int dimensionFromSpan(double min_value, double max_value, double resolution) {
+    if (resolution <= 0.0 || max_value <= min_value) {
+        return 0;
+    }
+    return static_cast<int>(std::ceil((max_value - min_value) / resolution));
+}
+
+[[nodiscard]] AxisIndexRange candidateRange(double from,
+                                            double to,
+                                            double radius,
+                                            double map_min,
+                                            double map_max,
+                                            double resolution) {
+    const int dimension = dimensionFromSpan(map_min, map_max, resolution);
+    if (dimension == 0) {
+        return {};
+    }
+
+    const double extent_min = std::min(from, to) - radius;
+    const double extent_max = std::max(from, to) + radius;
+    const int first = static_cast<int>(std::floor((extent_min - map_min) / resolution)) - 1;
+    const int last = static_cast<int>(std::floor((extent_max - map_min) / resolution)) + 1;
+    return AxisIndexRange{
+        std::max(0, first),
+        std::min(dimension - 1, last),
+    };
+}
+
+[[nodiscard]] bool sphereFitsMapBounds(const Position3D& center,
+                                       double radius,
+                                       const types::MappingBounds& bounds) {
+    return xCm(center.x) - radius >= xCm(bounds.min_x) &&
+           xCm(center.x) + radius <= xCm(bounds.max_x) &&
+           yCm(center.y) - radius >= yCm(bounds.min_y) &&
+           yCm(center.y) + radius <= yCm(bounds.max_y) &&
+           zCm(center.z) - radius >= zCm(bounds.min_height) &&
+           zCm(center.z) + radius <= zCm(bounds.max_height);
+}
+
+[[nodiscard]] double clippedMidpoint(double voxel_min,
+                                     double voxel_max,
+                                     double map_min,
+                                     double map_max) {
+    const double clipped_min = std::max(voxel_min, map_min);
+    const double clipped_max = std::min(voxel_max, map_max);
+    return clipped_min + (clipped_max - clipped_min) * 0.5;
+}
+
+[[nodiscard]] Position3D voxelProbe(const geometry::VoxelAabb& box,
+                                    const types::MappingBounds& bounds) {
     return Position3D{
-        (xCm(from.x) + (xCm(to.x) - xCm(from.x)) * t) * x_extent[cm],
-        (yCm(from.y) + (yCm(to.y) - yCm(from.y)) * t) * y_extent[cm],
-        (zCm(from.z) + (zCm(to.z) - zCm(from.z)) * t) * z_extent[cm],
+        clippedMidpoint(box.min[0], box.max[0], xCm(bounds.min_x), xCm(bounds.max_x)) * x_extent[cm],
+        clippedMidpoint(box.min[1], box.max[1], yCm(bounds.min_y), yCm(bounds.max_y)) * y_extent[cm],
+        clippedMidpoint(box.min[2], box.max[2], zCm(bounds.min_height), zCm(bounds.max_height)) *
+            z_extent[cm],
     };
 }
 
@@ -109,18 +170,42 @@ bool MockMovement::pathIsClear(const Position3D& from, const Position3D& to) con
     if (hidden_map_ == nullptr) {
         return true;
     }
+    if (!sphereIsClear(from) || !sphereIsClear(to)) {
+        return false;
+    }
 
-    const double dx = xCm(to.x) - xCm(from.x);
-    const double dy = yCm(to.y) - yCm(from.y);
-    const double dz = zCm(to.z) - zCm(from.z);
-    const double distance = std::sqrt(dx * dx + dy * dy + dz * dz);
-    const double resolution = lengthCm(hidden_map_->getMapConfig().resolution);
-    const int samples = std::max(1, static_cast<int>(std::ceil(distance / std::max(resolution * 0.5, 1.0))));
+    const types::MapConfig config = hidden_map_->getMapConfig();
+    const double resolution = lengthCm(config.resolution);
+    if (resolution <= 0.0) {
+        return false;
+    }
 
-    for (int sample = 0; sample <= samples; ++sample) {
-        const double t = static_cast<double>(sample) / static_cast<double>(samples);
-        if (!sphereIsClear(interpolatedPosition(from, to, t))) {
-            return false;
+    const double radius = std::max(0.0, lengthCm(drone_radius_));
+    const AxisIndexRange x_range = candidateRange(
+        xCm(from.x), xCm(to.x), radius,
+        xCm(config.boundaries.min_x), xCm(config.boundaries.max_x), resolution);
+    const AxisIndexRange y_range = candidateRange(
+        yCm(from.y), yCm(to.y), radius,
+        yCm(config.boundaries.min_y), yCm(config.boundaries.max_y), resolution);
+    const AxisIndexRange z_range = candidateRange(
+        zCm(from.z), zCm(to.z), radius,
+        zCm(config.boundaries.min_height), zCm(config.boundaries.max_height), resolution);
+    if (x_range.empty() || y_range.empty() || z_range.empty()) {
+        return false;
+    }
+
+    for (int x = x_range.first; x <= x_range.last; ++x) {
+        for (int y = y_range.first; y <= y_range.last; ++y) {
+            for (int z = z_range.first; z <= z_range.last; ++z) {
+                const geometry::VoxelAabb box = geometry::voxelAabb(config, x, y, z);
+                if (!blocksMovement(hidden_map_->atVoxel(voxelProbe(box, config.boundaries)))) {
+                    continue;
+                }
+                if (geometry::squaredDistanceFromSegmentToAabb(from, to, box) <=
+                    radius * radius + kCollisionEpsilon) {
+                    return false;
+                }
+            }
         }
     }
 
@@ -131,34 +216,35 @@ bool MockMovement::sphereIsClear(const Position3D& center) const {
     if (hidden_map_ == nullptr) {
         return true;
     }
-    if (!hidden_map_->isInBounds(center) || blocksMovement(hidden_map_->atVoxel(center))) {
+
+    const types::MapConfig config = hidden_map_->getMapConfig();
+    const double resolution = lengthCm(config.resolution);
+    const double radius = std::max(0.0, lengthCm(drone_radius_));
+    if (resolution <= 0.0 || !hidden_map_->isInBounds(center) ||
+        !sphereFitsMapBounds(center, radius, config.boundaries)) {
         return false;
     }
 
-    const double radius = lengthCm(drone_radius_);
-    const double resolution = lengthCm(hidden_map_->getMapConfig().resolution);
-    if (radius <= 0.0 || resolution <= 0.0) {
-        return true;
+    const AxisIndexRange x_range = candidateRange(
+        xCm(center.x), xCm(center.x), radius,
+        xCm(config.boundaries.min_x), xCm(config.boundaries.max_x), resolution);
+    const AxisIndexRange y_range = candidateRange(
+        yCm(center.y), yCm(center.y), radius,
+        yCm(config.boundaries.min_y), yCm(config.boundaries.max_y), resolution);
+    const AxisIndexRange z_range = candidateRange(
+        zCm(center.z), zCm(center.z), radius,
+        zCm(config.boundaries.min_height), zCm(config.boundaries.max_height), resolution);
+    if (x_range.empty() || y_range.empty() || z_range.empty()) {
+        return false;
     }
 
-    const int steps = std::max(1, static_cast<int>(std::ceil(radius / resolution)));
-    for (int dx = -steps; dx <= steps; ++dx) {
-        for (int dy = -steps; dy <= steps; ++dy) {
-            for (int dz = -steps; dz <= steps; ++dz) {
-                const double x_offset = static_cast<double>(dx) * resolution;
-                const double y_offset = static_cast<double>(dy) * resolution;
-                const double z_offset = static_cast<double>(dz) * resolution;
-                if (x_offset * x_offset + y_offset * y_offset + z_offset * z_offset >
-                    radius * radius + 1.0e-6) {
-                    continue;
-                }
-
-                const Position3D sample{
-                    (xCm(center.x) + x_offset) * x_extent[cm],
-                    (yCm(center.y) + y_offset) * y_extent[cm],
-                    (zCm(center.z) + z_offset) * z_extent[cm],
-                };
-                if (!hidden_map_->isInBounds(sample) || blocksMovement(hidden_map_->atVoxel(sample))) {
+    for (int x = x_range.first; x <= x_range.last; ++x) {
+        for (int y = y_range.first; y <= y_range.last; ++y) {
+            for (int z = z_range.first; z <= z_range.last; ++z) {
+                const geometry::VoxelAabb box = geometry::voxelAabb(config, x, y, z);
+                if (blocksMovement(hidden_map_->atVoxel(voxelProbe(box, config.boundaries))) &&
+                    geometry::squaredDistanceToAabb(geometry::coordinatesCm(center), box) <=
+                        radius * radius + kCollisionEpsilon) {
                     return false;
                 }
             }

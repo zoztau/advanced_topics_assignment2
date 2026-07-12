@@ -12,6 +12,7 @@ add_library(drone_mapper
     src/config/ConfigLoader.cpp
     src/comparison/MapsComparison.cpp
     src/drone/DroneControlImpl.cpp
+    src/geometry/VoxelGeometry.h
     src/gps/MockGPS.cpp
     src/lidar/MockLidar.cpp
     src/map/Map3DImpl.cpp
@@ -35,6 +36,8 @@ target_compile_options(drone_mapper
 target_include_directories(drone_mapper
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 target_link_libraries(drone_mapper
