@@ -252,7 +252,9 @@ std::vector<double> MapsComparison::compare(const IMap3D& original,
 }
 
 double MapsComparison::compareSingle(const IMap3D& origin, const IMap3D& target) {
-    return compareWithinDomain(origin, target, origin.getMapConfig());
+    types::MapConfig domain = origin.getMapConfig();
+    domain.boundaries = intersectBounds(domain.boundaries, target.getMapConfig().boundaries);
+    return compareWithinDomain(origin, target, domain);
 }
 
 double MapsComparison::compareFiles(

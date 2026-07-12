@@ -361,6 +361,44 @@ TEST(SimulationRun, CallsMissionAndScoresCompletedMap) {
     EXPECT_DOUBLE_EQ(result.mission_score, 100.0);
 }
 
+TEST(SimulationRun, ScoresOnlyTheSharedOutputMissionDomain) {
+    const types::MapConfig hidden_config =
+        mapConfig(bounds(0.0, 30.0, 0.0, 10.0, 0.0, 10.0), 10.0);
+    const types::MapConfig output_config =
+        mapConfig(bounds(10.0, 30.0, 0.0, 10.0, 0.0, 10.0), 10.0);
+    auto hidden = Map3DImpl::createEmpty(hidden_config, types::VoxelOccupancy::Empty);
+    hidden->set(pos(0.0, 0.0, 0.0), types::VoxelOccupancy::Occupied);
+    auto output = Map3DImpl::createEmpty(output_config, types::VoxelOccupancy::Empty);
+    auto output_for_algorithm =
+        Map3DImpl::createEmpty(output_config, types::VoxelOccupancy::Empty);
+    auto mission = std::make_unique<CompletedMission>();
+    types::MissionConfigData mission_config = missionConfig();
+    mission_config.mission_bounds = output_config.boundaries;
+
+    SimulationRunImpl run{
+        std::move(hidden),
+        std::move(output),
+        std::make_unique<NullGPS>(),
+        std::make_unique<NullMovement>(),
+        std::make_unique<NullLidar>(),
+        std::make_unique<NullAlgorithm>(*output_for_algorithm),
+        std::make_unique<NullDroneControl>(),
+        std::move(mission),
+        types::SimulationConfigData{},
+        mission_config,
+        types::ResolutionRequestStatus::Accepted,
+        std::filesystem::temp_directory_path() / "simulation_run_shared_domain_output.npy",
+    };
+
+    const types::SimulationResult result = run.run();
+
+    ASSERT_EQ(result.mission_results.size(), 1U);
+    EXPECT_EQ(result.mission_results.front().status, types::MissionRunStatus::Completed);
+    EXPECT_EQ(result.mission_results.front().steps, 1U);
+    EXPECT_TRUE(result.mission_results.front().errors.empty());
+    EXPECT_DOUBLE_EQ(result.mission_score, 100.0);
+}
+
 TEST(MissionControl, StopsWhenDroneReportsCompleted) {
     const types::MapConfig config = mapConfig(bounds(0.0, 50.0, 0.0, 50.0, 0.0, 50.0), 10.0);
     auto hidden = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Empty);
@@ -1059,6 +1097,45 @@ TEST(MapsComparison, IdenticalMapsReturnPerfectScoreAndDifferentMapsDoNot) {
 
     EXPECT_DOUBLE_EQ(MapsComparison::compareSingle(*origin, *same), 100.0);
     EXPECT_LT(MapsComparison::compareSingle(*origin, *different), 100.0);
+}
+
+TEST(MapsComparison, DifferentBoundariesWithIdenticalSharedVoxelsScorePerfectly) {
+    const types::MapConfig origin_config =
+        mapConfig(bounds(0.0, 30.0, 0.0, 10.0, 0.0, 10.0), 10.0);
+    const types::MapConfig target_config =
+        mapConfig(bounds(10.0, 30.0, 0.0, 10.0, 0.0, 10.0), 10.0);
+    auto origin = Map3DImpl::createEmpty(origin_config, types::VoxelOccupancy::Empty);
+    auto target = Map3DImpl::createEmpty(target_config, types::VoxelOccupancy::Empty);
+
+    EXPECT_DOUBLE_EQ(MapsComparison::compareSingle(*origin, *target), 100.0);
+}
+
+TEST(MapsComparison, DifferenceInsideSharedDomainReducesScore) {
+    const types::MapConfig origin_config =
+        mapConfig(bounds(0.0, 30.0, 0.0, 10.0, 0.0, 10.0), 10.0);
+    const types::MapConfig target_config =
+        mapConfig(bounds(10.0, 30.0, 0.0, 10.0, 0.0, 10.0), 10.0);
+    auto origin = Map3DImpl::createEmpty(origin_config, types::VoxelOccupancy::Empty);
+    auto target = Map3DImpl::createEmpty(target_config, types::VoxelOccupancy::Empty);
+    origin->set(pos(20.0, 0.0, 0.0), types::VoxelOccupancy::Occupied);
+
+    const double score = MapsComparison::compareSingle(*origin, *target);
+
+    EXPECT_DOUBLE_EQ(score, 50.0);
+    EXPECT_LT(score, 100.0);
+}
+
+TEST(MapsComparison, CellsOutsideSharedDomainDoNotAffectScore) {
+    const types::MapConfig origin_config =
+        mapConfig(bounds(0.0, 30.0, 0.0, 10.0, 0.0, 10.0), 10.0);
+    const types::MapConfig target_config =
+        mapConfig(bounds(10.0, 40.0, 0.0, 10.0, 0.0, 10.0), 10.0);
+    auto origin = Map3DImpl::createEmpty(origin_config, types::VoxelOccupancy::Empty);
+    auto target = Map3DImpl::createEmpty(target_config, types::VoxelOccupancy::Empty);
+    origin->set(pos(0.0, 0.0, 0.0), types::VoxelOccupancy::Occupied);
+    target->set(pos(30.0, 0.0, 0.0), types::VoxelOccupancy::Occupied);
+
+    EXPECT_DOUBLE_EQ(MapsComparison::compareSingle(*origin, *target), 100.0);
 }
 
 TEST(MapsComparison, FileComparisonUsesConfiguredBoundaries) {
