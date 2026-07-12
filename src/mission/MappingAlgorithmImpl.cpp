@@ -19,6 +19,10 @@ constexpr double kLeanScanResolutionThresholdCm = 15.0;
 constexpr std::size_t kConservativeScanCellLimit = 80;
 constexpr std::size_t kLeanScanCellLimit = 1000;
 constexpr std::size_t kMaxBfsCells = 6000;
+constexpr std::size_t kMaxAdaptiveScansWithoutStepLimit = 512;
+constexpr double kRayKeyScale = 1.0e9;
+constexpr double kScanDistanceWeightDecay = 0.12;
+constexpr double kMinimumUsefulPotentialFraction = 0.05;
 
 [[nodiscard]] double xCm(XLength value) {
     return value.force_numerical_value_in(cm);
@@ -37,6 +41,10 @@ constexpr std::size_t kMaxBfsCells = 6000;
 }
 
 [[nodiscard]] double horizontalDeg(HorizontalAngle value) {
+    return value.force_numerical_value_in(deg);
+}
+
+[[nodiscard]] double altitudeDeg(AltitudeAngle value) {
     return value.force_numerical_value_in(deg);
 }
 
@@ -72,6 +80,14 @@ constexpr std::size_t kMaxBfsCells = 6000;
     return MappingAlgorithmImpl::Direction{direction.dy, -direction.dx, 0};
 }
 
+[[nodiscard]] std::size_t beamsOnCircle(std::size_t circle_index) {
+    std::size_t count = 1;
+    for (std::size_t circle = 0; circle < circle_index; ++circle) {
+        count *= 4;
+    }
+    return count;
+}
+
 [[nodiscard]] double directionHeadingDegrees(const MappingAlgorithmImpl::Direction& direction) {
     if (direction.dx == 0 && direction.dy == 0) {
         return 0.0;
@@ -80,30 +96,45 @@ constexpr std::size_t kMaxBfsCells = 6000;
                                        static_cast<double>(direction.dx)) * 180.0 / M_PI);
 }
 
-[[nodiscard]] Orientation scanOrientationForDirection(const MappingAlgorithmImpl::Direction& direction) {
-    const double horizontal = directionHeadingDegrees(direction);
+[[nodiscard]] Orientation scanOrientationForDirection(const MappingAlgorithmImpl::Direction& direction,
+                                                      Orientation heading) {
+    const double horizontal = normalizeDegrees(
+        directionHeadingDegrees(direction) - horizontalDeg(heading.horizontal));
     const double horizontal_length =
         std::hypot(static_cast<double>(direction.dx), static_cast<double>(direction.dy));
-    const double altitude = std::atan2(static_cast<double>(direction.dz), horizontal_length) * 180.0 / M_PI;
+    const double altitude =
+        std::atan2(static_cast<double>(direction.dz), horizontal_length) * 180.0 / M_PI -
+        altitudeDeg(heading.altitude);
     return Orientation{horizontal * horizontal_angle[deg], altitude * altitude_angle[deg]};
 }
 
-[[nodiscard]] bool sameDirection(const MappingAlgorithmImpl::Direction& left,
-                                 const MappingAlgorithmImpl::Direction& right) {
-    return left.dx == right.dx && left.dy == right.dy && left.dz == right.dz;
+[[nodiscard]] Orientation scanOrientationToward(const Position3D& target,
+                                                const types::DroneState& state) {
+    const double dx = xCm(target.x) - xCm(state.position.x);
+    const double dy = yCm(target.y) - yCm(state.position.y);
+    const double dz = zCm(target.z) - zCm(state.position.z);
+    const double horizontal_length = std::hypot(dx, dy);
+    const double horizontal = normalizeDegrees(
+        std::atan2(dy, dx) * 180.0 / M_PI - horizontalDeg(state.heading.horizontal));
+    const double altitude =
+        std::atan2(dz, horizontal_length) * 180.0 / M_PI - altitudeDeg(state.heading.altitude);
+    return Orientation{horizontal * horizontal_angle[deg], altitude * altitude_angle[deg]};
 }
 
-void addUniqueDirection(std::vector<MappingAlgorithmImpl::Direction>& directions,
-                        MappingAlgorithmImpl::Direction direction) {
-    if (direction.dx == 0 && direction.dy == 0 && direction.dz == 0) {
-        return;
+[[nodiscard]] std::optional<std::tuple<long long, long long, long long>> normalizedRayKey(
+    const Position3D& target,
+    const Position3D& origin) {
+    const double dx = xCm(target.x) - xCm(origin.x);
+    const double dy = yCm(target.y) - yCm(origin.y);
+    const double dz = zCm(target.z) - zCm(origin.z);
+    const double length = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (length <= kEpsilon) {
+        return std::nullopt;
     }
-    const auto exists = std::find_if(directions.begin(), directions.end(), [&](const auto& current) {
-        return sameDirection(current, direction);
-    });
-    if (exists == directions.end()) {
-        directions.push_back(direction);
-    }
+    return std::make_tuple(
+        std::llround(kRayKeyScale * dx / length),
+        std::llround(kRayKeyScale * dy / length),
+        std::llround(kRayKeyScale * dz / length));
 }
 
 [[nodiscard]] types::MovementCommand rotateCommand(types::RotationDirection direction, HorizontalAngle angle) {
@@ -130,14 +161,6 @@ void addUniqueDirection(std::vector<MappingAlgorithmImpl::Direction>& directions
 
 [[nodiscard]] types::MappingStepCommand workingCommand(types::MovementCommand movement) {
     return types::MappingStepCommand{movement, std::nullopt, types::AlgorithmStatus::Working};
-}
-
-[[nodiscard]] types::MappingStepCommand finishedCommand() {
-    return types::MappingStepCommand{
-        std::nullopt,
-        std::nullopt,
-        types::AlgorithmStatus::FinishedWithUnmappableVoxels,
-    };
 }
 
 [[nodiscard]] int dimensionFromSpan(double min_value, double max_value, double resolution) {
@@ -195,6 +218,27 @@ std::size_t MappingAlgorithmImpl::maxScannedCells() const {
     return std::min(kConservativeScanCellLimit, step_based_limit);
 }
 
+types::MappingStepCommand MappingAlgorithmImpl::finishedCommand() const {
+    const std::array<int, 3> dimensions = dimensionsFromConfig(output_map_.getMapConfig());
+    types::AlgorithmStatus status = types::AlgorithmStatus::Finished;
+
+    for (int x = 0; x < dimensions[0]; ++x) {
+        for (int y = 0; y < dimensions[1]; ++y) {
+            for (int z = 0; z < dimensions[2]; ++z) {
+                const types::VoxelOccupancy occupancy =
+                    output_map_.atVoxel(cellCenter(GridIndex{x, y, z}));
+                if (occupancy == types::VoxelOccupancy::Unmapped ||
+                    occupancy == types::VoxelOccupancy::PotentiallyOccupied) {
+                    status = types::AlgorithmStatus::FinishedWithUnmappableVoxels;
+                    return types::MappingStepCommand{std::nullopt, std::nullopt, status};
+                }
+            }
+        }
+    }
+
+    return types::MappingStepCommand{std::nullopt, std::nullopt, status};
+}
+
 MappingAlgorithmImpl::GridIndex MappingAlgorithmImpl::gridFromPosition(const Position3D& position) const {
     const types::MapConfig config = output_map_.getMapConfig();
     const double resolution = lengthCm(config.resolution);
@@ -233,26 +277,28 @@ bool MappingAlgorithmImpl::sameCell(const GridIndex& left, const GridIndex& righ
     return left.x == right.x && left.y == right.y && left.z == right.z;
 }
 
-bool MappingAlgorithmImpl::isKnownSafe(const GridIndex& index, const GridIndex& current) const {
+MappingAlgorithmImpl::SafetyAnalysis MappingAlgorithmImpl::analyzeKnownSafety(
+    const GridIndex& index,
+    const GridIndex& current,
+    bool collect_all_unresolved) const {
+    SafetyAnalysis analysis{};
     if (!inGrid(index)) {
-        return false;
+        analysis.hard_blocked = true;
+        return analysis;
     }
 
     const Position3D center = cellCenter(index);
     if (!output_map_.isInBounds(center)) {
-        return false;
-    }
-
-    const types::VoxelOccupancy center_value = output_map_.atVoxel(center);
-    if (center_value != types::VoxelOccupancy::Empty && !sameCell(index, current)) {
-        return false;
+        analysis.hard_blocked = true;
+        return analysis;
     }
 
     const types::MapConfig config = output_map_.getMapConfig();
     const double resolution = lengthCm(config.resolution);
-    const double radius = lengthCm(drone_config_.radius);
+    const double radius = std::max(0.0, lengthCm(drone_config_.radius));
     if (resolution <= 0.0) {
-        return false;
+        analysis.hard_blocked = true;
+        return analysis;
     }
 
     const int cell_radius = std::max(0, static_cast<int>(std::ceil(radius / resolution)));
@@ -262,7 +308,8 @@ bool MappingAlgorithmImpl::isKnownSafe(const GridIndex& index, const GridIndex& 
                 const GridIndex check{index.x + dx, index.y + dy, index.z + dz};
                 if (!inGrid(check)) {
                     if (squaredDistanceToCellAabb(center, check, config) <= radius * radius + kEpsilon) {
-                        return false;
+                        analysis.hard_blocked = true;
+                        return analysis;
                     }
                     continue;
                 }
@@ -272,22 +319,44 @@ bool MappingAlgorithmImpl::isKnownSafe(const GridIndex& index, const GridIndex& 
                 }
 
                 const types::VoxelOccupancy occupancy = output_map_.atVoxel(cellCenter(check));
-                if (occupancy != types::VoxelOccupancy::Empty && !sameCell(check, current)) {
-                    return false;
+                if (occupancy == types::VoxelOccupancy::Empty || sameCell(check, current)) {
+                    continue;
                 }
+                if (occupancy == types::VoxelOccupancy::Unmapped ||
+                    occupancy == types::VoxelOccupancy::PotentiallyOccupied) {
+                    // Another observation can turn either state into Empty, so
+                    // these voxels are actionable rather than permanent blocks.
+                    analysis.unresolved.push_back(check);
+                    if (!collect_all_unresolved) {
+                        return analysis;
+                    }
+                    continue;
+                }
+                analysis.hard_blocked = true;
+                return analysis;
             }
         }
     }
 
-    return true;
+    return analysis;
 }
 
-bool MappingAlgorithmImpl::isKnownSafePath(const GridIndex& from,
-                                           const GridIndex& to,
-                                           const GridIndex& current) const {
-    if (!isKnownSafe(to, current)) {
-        return false;
-    }
+MappingAlgorithmImpl::SafetyAnalysis MappingAlgorithmImpl::analyzeKnownSafePath(
+    const GridIndex& from,
+    const GridIndex& to,
+    const GridIndex& current,
+    bool collect_all_unresolved) const {
+    SafetyAnalysis result{};
+    std::set<long long> unresolved_keys;
+    const auto merge = [&](const SafetyAnalysis& analysis) {
+        result.hard_blocked = result.hard_blocked || analysis.hard_blocked;
+        for (const GridIndex& blocker : analysis.unresolved) {
+            const long long key = flatKey(blocker);
+            if (unresolved_keys.insert(key).second) {
+                result.unresolved.push_back(blocker);
+            }
+        }
+    };
 
     const Position3D from_center = cellCenter(from);
     const Position3D to_center = cellCenter(to);
@@ -298,6 +367,7 @@ bool MappingAlgorithmImpl::isKnownSafePath(const GridIndex& from,
     const double resolution = lengthCm(output_map_.getMapConfig().resolution);
     const int samples = std::max(1, static_cast<int>(std::ceil(distance / std::max(resolution * 0.5, 1.0))));
 
+    std::set<long long> analyzed_indices;
     for (int sample = 1; sample <= samples; ++sample) {
         const double t = static_cast<double>(sample) / static_cast<double>(samples);
         const Position3D position{
@@ -306,12 +376,30 @@ bool MappingAlgorithmImpl::isKnownSafePath(const GridIndex& from,
             (zCm(from_center.z) + t * dz) * z_extent[cm],
         };
         const GridIndex sample_index = gridFromPosition(position);
-        if (!isKnownSafe(sample_index, current)) {
-            return false;
+        if (!inGrid(sample_index)) {
+            result.hard_blocked = true;
+            return result;
+        }
+        if (!analyzed_indices.insert(flatKey(sample_index)).second) {
+            continue;
+        }
+        merge(analyzeKnownSafety(sample_index, current, collect_all_unresolved));
+        if (result.hard_blocked || (!collect_all_unresolved && !result.unresolved.empty())) {
+            return result;
         }
     }
 
-    return true;
+    return result;
+}
+
+bool MappingAlgorithmImpl::isKnownSafe(const GridIndex& index, const GridIndex& current) const {
+    return analyzeKnownSafety(index, current, false).safe();
+}
+
+bool MappingAlgorithmImpl::isKnownSafePath(const GridIndex& from,
+                                           const GridIndex& to,
+                                           const GridIndex& current) const {
+    return analyzeKnownSafePath(from, to, current, false).safe();
 }
 
 double MappingAlgorithmImpl::coverageScore(const GridIndex& index) const {
@@ -354,7 +442,7 @@ double MappingAlgorithmImpl::clearanceScore(const GridIndex& index) const {
     return score;
 }
 
-double MappingAlgorithmImpl::scanPotentialScore(const GridIndex& current,
+double MappingAlgorithmImpl::scanPotentialScore(const Position3D& origin,
                                                 const Direction& direction) const {
     if (direction.dx == 0 && direction.dy == 0 && direction.dz == 0) {
         return 0.0;
@@ -365,27 +453,89 @@ double MappingAlgorithmImpl::scanPotentialScore(const GridIndex& current,
         return 0.0;
     }
 
-    const int max_cells = std::max(1, static_cast<int>(std::ceil(lengthCm(lidar_config_.z_max) / resolution)));
-    double score = 0.0;
-    for (int step = 1; step <= max_cells; ++step) {
-        const GridIndex sample{
-            current.x + direction.dx * step,
-            current.y + direction.dy * step,
-            current.z + direction.dz * step,
-        };
-        if (!inGrid(sample)) {
-            break;
-        }
+    const double lidar_range = lengthCm(lidar_config_.z_max);
+    if (lidar_range <= 0.0 || lidar_config_.fov_circles == 0) {
+        return 0.0;
+    }
 
-        const types::VoxelOccupancy occupancy = output_map_.atVoxel(cellCenter(sample));
-        const double distance_weight = 1.0 / (1.0 + 0.12 * static_cast<double>(step));
-        if (occupancy == types::VoxelOccupancy::Unmapped) {
-            score += distance_weight;
-        } else if (occupancy == types::VoxelOccupancy::PotentiallyOccupied) {
-            score += 0.35 * distance_weight;
+    const double horizontal_length =
+        std::hypot(static_cast<double>(direction.dx), static_cast<double>(direction.dy));
+    const double center_horizontal =
+        std::atan2(static_cast<double>(direction.dy), static_cast<double>(direction.dx));
+    const double center_altitude =
+        std::atan2(static_cast<double>(direction.dz), horizontal_length);
+    const double sample_step = 0.5 * resolution;
+    const double z_min = lengthCm(lidar_config_.z_min);
+    const double circle_spacing = lengthCm(lidar_config_.d);
+
+    std::set<long long> scored_voxels;
+    double score = 0.0;
+    const auto score_beam = [&](double horizontal, double altitude) {
+        const double cos_altitude = std::cos(altitude);
+        const double ray_x = cos_altitude * std::cos(horizontal);
+        const double ray_y = cos_altitude * std::sin(horizontal);
+        const double ray_z = std::sin(altitude);
+
+        for (double distance = sample_step; distance <= lidar_range + kEpsilon;
+             distance += sample_step) {
+            const Position3D sample_position{
+                origin.x + ray_x * distance * x_extent[cm],
+                origin.y + ray_y * distance * y_extent[cm],
+                origin.z + ray_z * distance * z_extent[cm],
+            };
+            const GridIndex sample = gridFromPosition(sample_position);
+            if (!inGrid(sample)) {
+                break;
+            }
+
+            const types::VoxelOccupancy occupancy = output_map_.atVoxel(cellCenter(sample));
+            if (occupancy == types::VoxelOccupancy::Occupied) {
+                break;
+            }
+            if (!scored_voxels.insert(flatKey(sample)).second) {
+                continue;
+            }
+
+            const double cell_distance = distance / resolution;
+            const double distance_weight =
+                1.0 / (1.0 + kScanDistanceWeightDecay * cell_distance);
+            if (occupancy == types::VoxelOccupancy::Unmapped) {
+                score += distance_weight;
+            } else if (occupancy == types::VoxelOccupancy::PotentiallyOccupied) {
+                score += 0.35 * distance_weight;
+            }
+        }
+    };
+
+    score_beam(center_horizontal, center_altitude);
+    for (std::size_t circle = 1; circle < lidar_config_.fov_circles; ++circle) {
+        const std::size_t beam_count = beamsOnCircle(circle);
+        const double radius = static_cast<double>(circle) * circle_spacing;
+        for (std::size_t beam = 0; beam < beam_count; ++beam) {
+            const double theta =
+                2.0 * M_PI * static_cast<double>(beam) / static_cast<double>(beam_count);
+            const double horizontal_offset = radius * std::cos(theta);
+            const double altitude_offset = radius * std::sin(theta);
+            const double horizontal_delta = std::atan2(horizontal_offset, z_min);
+            const double altitude_delta = std::atan2(altitude_offset, z_min);
+            score_beam(center_horizontal + horizontal_delta,
+                       center_altitude + altitude_delta);
         }
     }
+
     return score;
+}
+
+double MappingAlgorithmImpl::minimumUsefulScanPotential() const {
+    const double resolution = lengthCm(output_map_.getMapConfig().resolution);
+    if (resolution <= 0.0) {
+        return 1.0;
+    }
+
+    const int max_cells =
+        std::max(1, static_cast<int>(std::ceil(lengthCm(lidar_config_.z_max) / resolution)));
+    return kMinimumUsefulPotentialFraction /
+           (1.0 + kScanDistanceWeightDecay * static_cast<double>(max_cells));
 }
 
 bool MappingAlgorithmImpl::isFrontier(const GridIndex& index) const {
@@ -647,86 +797,121 @@ std::optional<types::MappingStepCommand> MappingAlgorithmImpl::commandTowardTarg
     return workingCommand(advanceCommand(step_distance * cm));
 }
 
-bool MappingAlgorithmImpl::movementReachesTarget(const types::DroneState& state,
-                                                 const GridIndex& current,
-                                                 const GridIndex& target,
-                                                 const types::MappingStepCommand& command) const {
-    if (!command.movement.has_value()) {
-        return false;
-    }
-
-    const types::MovementCommand& movement = *command.movement;
-    if (movement.type == types::MovementCommandType::Elevate) {
-        if (target.z == current.z) {
-            return false;
-        }
-        const double z_delta = zCm(cellCenter(target).z) - zCm(state.position.z);
-        return std::abs(z_delta) <= lengthCm(drone_config_.max_elevate) + kEpsilon;
-    }
-
-    if (movement.type != types::MovementCommandType::Advance || target.z != current.z) {
-        return false;
-    }
-
-    const Position3D target_center = cellCenter(target);
-    const double x_delta = xCm(target_center.x) - xCm(state.position.x);
-    const double y_delta = yCm(target_center.y) - yCm(state.position.y);
-    const double horizontal_distance = std::hypot(x_delta, y_delta);
-    if (horizontal_distance > lengthCm(drone_config_.max_advance) + kEpsilon) {
-        return false;
-    }
-
-    const double target_heading = normalizeDegrees(std::atan2(y_delta, x_delta) * 180.0 / M_PI);
-    double delta = normalizeDegrees(target_heading - horizontalDeg(state.heading.horizontal));
-    if (delta > 180.0) {
-        delta -= 360.0;
-    }
-    return std::abs(delta) <= 1.0;
-}
-
-std::optional<MappingAlgorithmImpl::Direction> MappingAlgorithmImpl::takeFirstScanForCell(
+std::optional<Orientation> MappingAlgorithmImpl::takeNextScanForCell(
     const GridIndex& current,
-    Orientation heading) {
+    const types::DroneState& state) {
     const long long key = flatKey(current);
-    if (scanned_cells_.contains(key) || scanned_cells_.size() >= maxScannedCells()) {
+    if ((!scanned_cells_.contains(key) && scanned_cells_.size() >= maxScannedCells()) ||
+        lidar_config_.fov_circles == 0 || lengthCm(lidar_config_.z_max) <= 0.0) {
         return std::nullopt;
     }
 
-    const Direction forward = horizontalDirection(heading);
+    const Direction forward = horizontalDirection(state.heading);
     const Direction left = leftOf(forward);
     const Direction right = rightOf(forward);
-    std::vector<Direction> directions;
-    directions.reserve(usesLeanScanPattern() ? 6U : 10U);
-    addUniqueDirection(directions, forward);
-    addUniqueDirection(directions, left);
-    addUniqueDirection(directions, right);
-    addUniqueDirection(directions, Direction{-forward.dx, -forward.dy, 0});
-    addUniqueDirection(directions, Direction{0, 0, 1});
-    addUniqueDirection(directions, Direction{0, 0, -1});
-    if (usesLeanScanPattern()) {
-        addUniqueDirection(directions, Direction{forward.dx + left.dx, forward.dy + left.dy, 0});
-        addUniqueDirection(directions, Direction{forward.dx + right.dx, forward.dy + right.dy, 0});
-    } else {
-        addUniqueDirection(directions, Direction{forward.dx + left.dx, forward.dy + left.dy, 0});
-        addUniqueDirection(directions, Direction{forward.dx + right.dx, forward.dy + right.dy, 0});
-        addUniqueDirection(directions, Direction{-forward.dx + left.dx, -forward.dy + left.dy, 0});
-        addUniqueDirection(directions, Direction{-forward.dx + right.dx, -forward.dy + right.dy, 0});
+    const std::array<Direction, 6> base_directions{
+        forward,
+        left,
+        right,
+        Direction{-forward.dx, -forward.dy, 0},
+        Direction{0, 0, 1},
+        Direction{0, 0, -1},
+    };
+
+    // Rebuild priorities from the updated map and issue only the best scan.
+    std::vector<std::pair<Direction, double>> useful_base_directions;
+    const double minimum_potential = minimumUsefulScanPotential();
+    for (const Direction& direction : base_directions) {
+        const auto attempt = std::make_tuple(key, direction.dx, direction.dy, direction.dz);
+        if (attempted_base_scans_.contains(attempt)) {
+            continue;
+        }
+
+        const double potential = scanPotentialScore(state.position, direction);
+        if (potential + kEpsilon >= minimum_potential) {
+            useful_base_directions.emplace_back(direction, potential);
+        }
     }
 
-    if (directions.empty()) {
+    std::stable_sort(useful_base_directions.begin(),
+                     useful_base_directions.end(),
+                     [](const auto& left_direction, const auto& right_direction) {
+        return left_direction.second > right_direction.second;
+    });
+
+    if (!useful_base_directions.empty()) {
+        const Direction direction = useful_base_directions.front().first;
+        attempted_base_scans_.insert(std::make_tuple(key, direction.dx, direction.dy, direction.dz));
+        scanned_cells_.insert(key);
+        return scanOrientationForDirection(direction, state.heading);
+    }
+
+    std::size_t& adaptive_scan_count = adaptive_scan_counts_[key];
+    if (mission_config_.max_steps == 0 &&
+        adaptive_scan_count >= kMaxAdaptiveScansWithoutStepLimit) {
         return std::nullopt;
     }
 
-    std::stable_sort(directions.begin(), directions.end(), [&](const Direction& left_direction,
-                                                               const Direction& right_direction) {
-        return scanPotentialScore(current, left_direction) > scanPotentialScore(current, right_direction);
-    });
+    const std::array<Direction, 6> candidate_directions{
+        forward,
+        left,
+        right,
+        Direction{-forward.dx, -forward.dy, 0},
+        Direction{0, 0, 1},
+        Direction{0, 0, -1},
+    };
+    const types::MapConfig config = output_map_.getMapConfig();
+    const double lidar_range = lengthCm(lidar_config_.z_max);
+    const double lidar_range_squared = lidar_range * lidar_range;
+    std::size_t& candidate_cursor = adaptive_candidate_cursors_[key];
+    candidate_cursor %= candidate_directions.size();
 
-    for (std::size_t index = 1; index < directions.size(); ++index) {
-        pending_scans_.push_back(directions[index]);
+    for (std::size_t offset = 0; offset < candidate_directions.size(); ++offset) {
+        const std::size_t candidate_index = (candidate_cursor + offset) % candidate_directions.size();
+        const Direction& direction = candidate_directions[candidate_index];
+        const GridIndex candidate{
+            current.x + direction.dx,
+            current.y + direction.dy,
+            current.z + direction.dz,
+        };
+        const SafetyAnalysis analysis = analyzeKnownSafePath(current, candidate, current);
+        if (analysis.safe() || analysis.hard_blocked) {
+            continue;
+        }
+
+        std::vector<GridIndex> blockers = analysis.unresolved;
+        std::stable_sort(blockers.begin(), blockers.end(), [&](const GridIndex& left_blocker,
+                                                               const GridIndex& right_blocker) {
+            return squaredDistanceToCellAabb(state.position, left_blocker, config) <
+                   squaredDistanceToCellAabb(state.position, right_blocker, config);
+        });
+
+        for (const GridIndex& blocker : blockers) {
+            if (squaredDistanceToCellAabb(state.position, blocker, config) >
+                lidar_range_squared + kEpsilon) {
+                continue;
+            }
+
+            const Position3D target = cellCenter(blocker);
+            const auto direction_key = normalizedRayKey(target, state.position);
+            if (!direction_key.has_value()) {
+                continue;
+            }
+            const auto [ray_x, ray_y, ray_z] = *direction_key;
+            const auto attempt = std::make_tuple(key, ray_x, ray_y, ray_z);
+            if (attempted_adaptive_rays_.contains(attempt)) {
+                continue;
+            }
+
+            attempted_adaptive_rays_.insert(attempt);
+            ++adaptive_scan_count;
+            candidate_cursor = (candidate_index + 1U) % candidate_directions.size();
+            scanned_cells_.insert(key);
+            return scanOrientationToward(target, state);
+        }
     }
-    scanned_cells_.insert(key);
-    return directions.front();
+
+    return std::nullopt;
 }
 
 void MappingAlgorithmImpl::rememberBranchTargets(const GridIndex& current) {
@@ -750,75 +935,47 @@ void MappingAlgorithmImpl::rememberBranchTargets(const GridIndex& current) {
     }
 }
 
-void MappingAlgorithmImpl::enqueueScansForCell(const GridIndex& current, Orientation heading) {
-    if (const auto first_direction = takeFirstScanForCell(current, heading)) {
-        pending_scans_.push_front(*first_direction);
-    }
-}
-
 types::MappingStepCommand MappingAlgorithmImpl::nextStep(const types::DroneState& state,
                                                          const types::LidarScanResult* latest_scan) {
-    const bool has_latest_scan = latest_scan != nullptr;
-    (void)has_latest_scan;
+    (void)latest_scan;
 
     const GridIndex current = gridFromPosition(state.position);
     if (!inGrid(current)) {
         return finishedCommand();
     }
 
-    if (mission_config_.max_steps > 0 && state.step_index + 1 >= mission_config_.max_steps) {
-        return finishedCommand();
-    }
-
     visited_cells_.insert(flatKey(current));
 
     if (pending_target_.has_value()) {
-        if (auto command = commandTowardTarget(state, current, *pending_target_)) {
+        const GridIndex target = *pending_target_;
+        if (auto command = commandTowardTarget(state, current, target)) {
             return *command;
         }
-    }
-
-    if (pending_scans_.empty()) {
-        enqueueScansForCell(current, state.heading);
-    }
-
-    if (!pending_scans_.empty()) {
-        const Direction direction = pending_scans_.front();
-        pending_scans_.pop_front();
-        return types::MappingStepCommand{
-            std::nullopt,
-            scanOrientationForDirection(direction),
-            types::AlgorithmStatus::Working,
-        };
     }
 
     rememberBranchTargets(current);
 
-    if (scanned_cells_.size() >= maxScannedCells()) {
-        return finishedCommand();
-    }
-
+    // DroneControl applies each requested scan before calling nextStep again.
+    // Reconsider movement first so a useful scan immediately stops scanning.
     if (auto local_move = chooseLocalMove(current, state.heading)) {
         pending_target_ = *local_move;
-        if (auto command = commandTowardTarget(state, current, *pending_target_)) {
-            if (movementReachesTarget(state, current, *local_move, *command)) {
-                if (const auto first_direction = takeFirstScanForCell(*local_move, state.heading)) {
-                    command->scan_orientation = scanOrientationForDirection(*first_direction);
-                }
-            }
+        if (auto command = commandTowardTarget(state, current, *local_move)) {
             return *command;
         }
+    }
+
+    if (const auto scan_orientation = takeNextScanForCell(current, state)) {
+        return types::MappingStepCommand{
+            std::nullopt,
+            *scan_orientation,
+            types::AlgorithmStatus::Working,
+        };
     }
 
     const std::vector<GridIndex> branch_path = pathToQueuedBranchTarget(current);
     if (branch_path.size() > 1U) {
         pending_target_ = branch_path[1];
-        if (auto command = commandTowardTarget(state, current, *pending_target_)) {
-            if (movementReachesTarget(state, current, branch_path[1], *command)) {
-                if (const auto first_direction = takeFirstScanForCell(branch_path[1], state.heading)) {
-                    command->scan_orientation = scanOrientationForDirection(*first_direction);
-                }
-            }
+        if (auto command = commandTowardTarget(state, current, branch_path[1])) {
             return *command;
         }
     }
@@ -826,12 +983,7 @@ types::MappingStepCommand MappingAlgorithmImpl::nextStep(const types::DroneState
     const std::vector<GridIndex> path = pathToBestCoverageTarget(current);
     if (path.size() > 1U) {
         pending_target_ = path[1];
-        if (auto command = commandTowardTarget(state, current, *pending_target_)) {
-            if (movementReachesTarget(state, current, path[1], *command)) {
-                if (const auto first_direction = takeFirstScanForCell(path[1], state.heading)) {
-                    command->scan_orientation = scanOrientationForDirection(*first_direction);
-                }
-            }
+        if (auto command = commandTowardTarget(state, current, path[1])) {
             return *command;
         }
     }

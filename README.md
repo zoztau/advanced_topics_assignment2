@@ -141,7 +141,7 @@ Output maps are signed 8-bit `.npy` files using the assignment values:
 
 The map backend applies `map_axes_offset` before converting physical centimeters to array indices. Map bounds are treated as half-open physical ranges: `min <= position < max`.
 
-`MappingAlgorithmImpl` keeps the required Assignment 2 `IMappingAlgorithm::nextStep(state, latest_scan)` API while reusing the Assignment 1 exploration idea: scan the current cell, read the output map that `DroneControlImpl` updates through `ScanResultToVoxels`, choose known-safe neighboring/frontier cells, and split rotate/advance/elevate commands according to the drone limits. The search is capped so all configuration combinations remain practical to run.
+`MappingAlgorithmImpl` keeps the required Assignment 2 `IMappingAlgorithm::nextStep(state, latest_scan)` API while reusing the Assignment 1 exploration idea: scan the current cell, read the output map that `DroneControlImpl` updates through `ScanResultToVoxels`, choose known-safe neighboring/frontier cells, and split rotate/advance/elevate commands according to the drone limits. When scanning is needed, it starts with the six principal directions, then aims additional rays at unresolved voxels that block otherwise-viable neighboring positions. Movement safety is checked again after every scan so the drone moves as soon as an unvisited path becomes known-safe. The search and adaptive scans are capped so all configuration combinations remain practical to run.
 
 Resolution policy: missing `output_mapping_resolution_factor` defaults to `1`. Values below `1` are logged immediately, reported as `IGNORED_TOO_SMALL`, and run with factor `1`. Values `>= 1` are reported as `ACCEPTED`.
 

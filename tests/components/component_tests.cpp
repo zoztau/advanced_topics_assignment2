@@ -10,12 +10,14 @@
 #include <drone_mapper/MockGPS.h>
 #include <drone_mapper/MockLidar.h>
 #include <drone_mapper/MockMovement.h>
+#include <drone_mapper/ScanResultToVoxels.h>
 #include <drone_mapper/SimulationManager.h>
 #include <drone_mapper/SimulationRunImpl.h>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -139,6 +141,20 @@ public:
 private:
     std::vector<types::DroneStepResult> results_;
     std::size_t next_ = 0;
+};
+
+class AlwaysContinueDroneControl final : public IDroneControl {
+public:
+    types::DroneStepResult step() override {
+        ++step_calls;
+        return types::DroneStepResult{types::DroneStepStatus::Continue, {}};
+    }
+
+    types::DroneState state() const override {
+        return types::DroneState{pos(10.0, 10.0, 10.0), makeHeading(0.0), step_calls};
+    }
+
+    std::size_t step_calls = 0;
 };
 
 class ScriptedAlgorithm final : public IMappingAlgorithm {
@@ -328,6 +344,29 @@ TEST(MissionControl, StopsWhenDroneReportsCompleted) {
     EXPECT_EQ(result.steps, 2U);
 }
 
+TEST(MissionControl, ReportsMaxStepsAfterExactConfiguredNumberOfCalls) {
+    const types::MapConfig config = mapConfig(bounds(0.0, 50.0, 0.0, 50.0, 0.0, 50.0), 10.0);
+    auto hidden = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Empty);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Unmapped);
+    types::MissionConfigData mission_config = missionConfig();
+    mission_config.max_steps = 3;
+    AlwaysContinueDroneControl drone_control;
+    MissionControlImpl mission{
+        mission_config,
+        droneConfig(),
+        *hidden,
+        *output,
+        drone_control,
+        std::filesystem::temp_directory_path() / "mission_control_max_steps_output.npy",
+    };
+
+    const types::MissionRunResult result = mission.runMission();
+
+    EXPECT_EQ(result.status, types::MissionRunStatus::MaxSteps);
+    EXPECT_EQ(result.steps, mission_config.max_steps);
+    EXPECT_EQ(drone_control.step_calls, mission_config.max_steps);
+}
+
 TEST(DroneControl, FirstStepPassesNullScanAndAppliesLidarMiss) {
     const types::MapConfig config = mapConfig(bounds(0.0, 80.0, 0.0, 80.0, 0.0, 80.0), 10.0);
     auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Unmapped);
@@ -358,19 +397,375 @@ TEST(DroneControl, FirstStepPassesNullScanAndAppliesLidarMiss) {
     EXPECT_EQ(output->atVoxel(pos(20.0, 10.0, 10.0)), types::VoxelOccupancy::Empty);
 }
 
-TEST(MappingAlgorithm, HandlesNullScanAndEventuallyFinishes) {
+TEST(DroneControl, NaturallyFinishedAlgorithmProducesCompleted) {
+    const types::MapConfig config = mapConfig(bounds(0.0, 80.0, 0.0, 80.0, 0.0, 80.0), 10.0);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Unmapped);
+    MockGPS gps{pos(10.0, 10.0, 10.0), makeHeading(0.0), 10.0 * cm};
+    MockMovement movement{gps};
+    FixedLidar lidar{lidarConfig()};
+    const types::MappingStepCommand finished_command{
+        std::nullopt,
+        std::nullopt,
+        types::AlgorithmStatus::Finished,
+    };
+    ScriptedAlgorithm algorithm{
+        missionConfig(), lidarConfig(), droneConfig(), *output, finished_command};
+    DroneControlImpl drone_control{
+        droneConfig(),
+        missionConfig(),
+        lidar,
+        gps,
+        movement,
+        *output,
+        algorithm,
+    };
+
+    const types::DroneStepResult result = drone_control.step();
+
+    EXPECT_EQ(result.status, types::DroneStepStatus::Completed);
+    EXPECT_EQ(algorithm.calls, 1);
+    EXPECT_EQ(lidar.scan_calls, 0);
+}
+
+TEST(MappingAlgorithm, DoesNotClaimCompletionAtMissionStepLimit) {
     const types::MapConfig config = mapConfig(bounds(0.0, 20.0, 0.0, 20.0, 0.0, 20.0), 10.0);
     auto output = Map3DImpl::createEmpty(config);
     MappingAlgorithmImpl algorithm{missionConfig(), lidarConfig(), droneConfig(), *output};
 
-    types::MappingStepCommand command =
-        algorithm.nextStep(types::DroneState{pos(10.0, 10.0, 10.0), makeHeading(0.0), 0}, nullptr);
+    const types::MappingStepCommand command = algorithm.nextStep(
+        types::DroneState{pos(10.0, 10.0, 10.0), makeHeading(0.0), missionConfig().max_steps - 1},
+        nullptr);
+
     EXPECT_EQ(command.status, types::AlgorithmStatus::Working);
-    EXPECT_TRUE(command.scan_orientation.has_value());
-    for (int i = 0; i < 10; ++i) {
-        command = algorithm.nextStep(types::DroneState{pos(10.0, 10.0, 10.0), makeHeading(0.0), 0}, nullptr);
+}
+
+TEST(MappingAlgorithm, FullyMappedMapReturnsFinished) {
+    const types::MappingBounds mission_bounds = bounds(0.0, 10.0, 0.0, 10.0, 0.0, 10.0);
+    const types::MapConfig config = mapConfig(mission_bounds, 10.0);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Empty);
+    const types::MissionConfigData mission{10, 10.0 * cm, 1.0, mission_bounds};
+    MappingAlgorithmImpl algorithm{mission, lidarConfig(), droneConfig(), *output};
+
+    const types::MappingStepCommand command = algorithm.nextStep(
+        types::DroneState{pos(5.0, 5.0, 5.0), makeHeading(0.0), 0}, nullptr);
+
+    EXPECT_EQ(command.status, types::AlgorithmStatus::Finished);
+}
+
+TEST(MappingAlgorithm, UnreachableUnknownVoxelReturnsFinishedWithUnmappableVoxels) {
+    const types::MappingBounds mission_bounds = bounds(0.0, 20.0, 0.0, 10.0, 0.0, 10.0);
+    const types::MapConfig config = mapConfig(mission_bounds, 10.0);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Occupied);
+    output->set(pos(5.0, 5.0, 5.0), types::VoxelOccupancy::Empty);
+    output->set(pos(15.0, 5.0, 5.0), types::VoxelOccupancy::Unmapped);
+    const types::MissionConfigData mission{10, 10.0 * cm, 1.0, mission_bounds};
+    types::LidarConfigData lidar = lidarConfig();
+    lidar.fov_circles = 0;
+    MappingAlgorithmImpl algorithm{mission, lidar, droneConfig(), *output};
+
+    const types::MappingStepCommand command = algorithm.nextStep(
+        types::DroneState{pos(5.0, 5.0, 5.0), makeHeading(0.0), 0}, nullptr);
+
+    EXPECT_EQ(command.status, types::AlgorithmStatus::FinishedWithUnmappableVoxels);
+}
+
+TEST(MappingAlgorithm, FineResolutionScansVerticalDiagonalsAndFindsMove) {
+    const types::MappingBounds mission_bounds = bounds(0.0, 55.0, 0.0, 55.0, 0.0, 55.0);
+    const types::MapConfig config = mapConfig(mission_bounds, 5.0);
+    auto output = Map3DImpl::createEmpty(config);
+    const types::MissionConfigData mission{200, 5.0 * cm, 1.0, mission_bounds};
+    const types::DroneConfigData drone{
+        3.0 * cm,
+        90.0 * horizontal_angle[deg],
+        20.0 * cm,
+        20.0 * cm,
+    };
+    const types::LidarConfigData lidar{5.0 * cm, 25.0 * cm, 2.0 * cm, 1};
+    MappingAlgorithmImpl algorithm{mission, lidar, drone, *output};
+    types::DroneState state{pos(27.5, 27.5, 27.5), makeHeading(90.0), 0};
+    std::optional<types::LidarScanResult> latest_scan;
+    bool saw_vertical_diagonal_scan = false;
+    bool saw_movement = false;
+    bool finished_before_movement = false;
+
+    for (std::size_t step = 0; step < 80; ++step) {
+        state.step_index = step;
+        const types::MappingStepCommand command =
+            algorithm.nextStep(state, latest_scan ? &(*latest_scan) : nullptr);
+        if (command.status != types::AlgorithmStatus::Working) {
+            finished_before_movement = true;
+            break;
+        }
+        if (command.movement.has_value()) {
+            saw_movement = true;
+            break;
+        }
+        ASSERT_TRUE(command.scan_orientation.has_value());
+
+        const double altitude = std::abs(
+            command.scan_orientation->altitude.force_numerical_value_in(deg));
+        if (altitude > 1.0 && altitude < 89.0) {
+            saw_vertical_diagonal_scan = true;
+        }
+
+        latest_scan = types::LidarScanResult{
+            types::LidarHit{
+                std::numeric_limits<double>::max() * cm,
+                *command.scan_orientation,
+            },
+        };
+        ScanResultToVoxels::applyToMap(
+            *output, state.position, state.heading, *latest_scan, lidar);
     }
+
+    EXPECT_TRUE(saw_vertical_diagonal_scan);
+    EXPECT_TRUE(saw_movement);
+    EXPECT_FALSE(finished_before_movement);
+}
+
+TEST(MappingAlgorithm, StopsBaseScanningAsSoonAsNeighborBecomesSafe) {
+    const types::MappingBounds mission_bounds = bounds(0.0, 55.0, 0.0, 55.0, 0.0, 55.0);
+    const types::MapConfig config = mapConfig(mission_bounds, 5.0);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Occupied);
+    const types::MissionConfigData mission{100, 5.0 * cm, 1.0, mission_bounds};
+    const types::DroneConfigData drone{
+        3.0 * cm,
+        90.0 * horizontal_angle[deg],
+        20.0 * cm,
+        20.0 * cm,
+    };
+    const types::LidarConfigData lidar{5.0 * cm, 25.0 * cm, 2.0 * cm, 1};
+    const Position3D current_position = pos(27.5, 27.5, 27.5);
+    const Position3D forward_center = pos(32.5, 27.5, 27.5);
+
+    output->set(current_position, types::VoxelOccupancy::Empty);
+    output->set(forward_center, types::VoxelOccupancy::Unmapped);
+    for (const Position3D& empty : std::vector<Position3D>{
+             pos(37.5, 27.5, 27.5),
+             pos(32.5, 22.5, 27.5),
+             pos(32.5, 32.5, 27.5),
+             pos(32.5, 27.5, 22.5),
+             pos(32.5, 27.5, 32.5),
+         }) {
+        output->set(empty, types::VoxelOccupancy::Empty);
+    }
+
+    MappingAlgorithmImpl algorithm{mission, lidar, drone, *output};
+    const types::DroneState state{current_position, makeHeading(0.0), 0};
+    const types::MappingStepCommand first_command = algorithm.nextStep(state, nullptr);
+    ASSERT_TRUE(first_command.scan_orientation.has_value());
+    EXPECT_NEAR(first_command.scan_orientation->horizontal.force_numerical_value_in(deg), 0.0, 1.0e-6);
+    EXPECT_NEAR(first_command.scan_orientation->altitude.force_numerical_value_in(deg), 0.0, 1.0e-6);
+
+    output->set(forward_center, types::VoxelOccupancy::Empty);
+    const types::LidarScanResult latest_scan{
+        types::LidarHit{std::numeric_limits<double>::max() * cm, *first_command.scan_orientation},
+    };
+    const types::MappingStepCommand next_command = algorithm.nextStep(state, &latest_scan);
+
+    EXPECT_TRUE(next_command.movement.has_value());
+    EXPECT_FALSE(next_command.scan_orientation.has_value());
+}
+
+TEST(MappingAlgorithm, ReprioritizesRemainingBaseDirectionsAfterScan) {
+    const types::MappingBounds mission_bounds = bounds(0.0, 55.0, 0.0, 55.0, 0.0, 55.0);
+    const types::MapConfig config = mapConfig(mission_bounds, 5.0);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Occupied);
+    const types::MissionConfigData mission{100, 5.0 * cm, 1.0, mission_bounds};
+    const types::DroneConfigData drone{
+        3.0 * cm,
+        90.0 * horizontal_angle[deg],
+        20.0 * cm,
+        20.0 * cm,
+    };
+    const types::LidarConfigData lidar{5.0 * cm, 25.0 * cm, 2.0 * cm, 1};
+    const Position3D current_position = pos(27.5, 27.5, 27.5);
+    const std::vector<Position3D> forward_unknown{
+        pos(32.5, 27.5, 27.5),
+        pos(37.5, 27.5, 27.5),
+        pos(42.5, 27.5, 27.5),
+    };
+
+    output->set(current_position, types::VoxelOccupancy::Empty);
+    for (const Position3D& unknown : forward_unknown) {
+        output->set(unknown, types::VoxelOccupancy::Unmapped);
+    }
+    output->set(pos(27.5, 32.5, 27.5), types::VoxelOccupancy::Unmapped);
+    output->set(pos(27.5, 37.5, 27.5), types::VoxelOccupancy::Unmapped);
+
+    MappingAlgorithmImpl algorithm{mission, lidar, drone, *output};
+    const types::DroneState state{current_position, makeHeading(0.0), 0};
+    const types::MappingStepCommand first_command = algorithm.nextStep(state, nullptr);
+    ASSERT_TRUE(first_command.scan_orientation.has_value());
+    EXPECT_NEAR(first_command.scan_orientation->horizontal.force_numerical_value_in(deg), 0.0, 1.0e-6);
+
+    for (const Position3D& mapped : forward_unknown) {
+        output->set(mapped, types::VoxelOccupancy::Occupied);
+    }
+    const types::LidarScanResult latest_scan{
+        types::LidarHit{std::numeric_limits<double>::max() * cm, *first_command.scan_orientation},
+    };
+    const types::MappingStepCommand next_command = algorithm.nextStep(state, &latest_scan);
+
+    ASSERT_TRUE(next_command.scan_orientation.has_value());
+    EXPECT_NEAR(next_command.scan_orientation->horizontal.force_numerical_value_in(deg), 90.0, 1.0e-6);
+}
+
+TEST(MappingAlgorithm, FieldOfViewPotentialIncludesOffAxisUnknownVoxels) {
+    const types::MappingBounds mission_bounds = bounds(0.0, 55.0, 0.0, 55.0, 0.0, 55.0);
+    const types::MapConfig config = mapConfig(mission_bounds, 5.0);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Occupied);
+    const types::MissionConfigData mission{100, 5.0 * cm, 1.0, mission_bounds};
+    const types::DroneConfigData drone{
+        3.0 * cm,
+        90.0 * horizontal_angle[deg],
+        20.0 * cm,
+        20.0 * cm,
+    };
+    const types::LidarConfigData lidar{5.0 * cm, 25.0 * cm, 5.0 * cm, 2};
+    const Position3D current_position = pos(27.5, 27.5, 27.5);
+    output->set(current_position, types::VoxelOccupancy::Empty);
+    output->set(pos(32.5, 32.5, 27.5), types::VoxelOccupancy::Unmapped);
+
+    MappingAlgorithmImpl algorithm{mission, lidar, drone, *output};
+    const types::MappingStepCommand command =
+        algorithm.nextStep(types::DroneState{current_position, makeHeading(0.0), 0}, nullptr);
+
+    ASSERT_TRUE(command.scan_orientation.has_value());
+    EXPECT_NEAR(command.scan_orientation->horizontal.force_numerical_value_in(deg), 0.0, 1.0e-6);
+}
+
+TEST(MappingAlgorithm, OccupiedVoxelBlocksScanPotentialBehindIt) {
+    const types::MappingBounds mission_bounds = bounds(0.0, 40.0, 0.0, 10.0, 0.0, 10.0);
+    const types::MapConfig config = mapConfig(mission_bounds, 10.0);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Occupied);
+    const Position3D current_position = pos(5.0, 5.0, 5.0);
+    output->set(current_position, types::VoxelOccupancy::Empty);
+    output->set(pos(25.0, 5.0, 5.0), types::VoxelOccupancy::Unmapped);
+    const types::MissionConfigData mission{100, 10.0 * cm, 1.0, mission_bounds};
+    const types::LidarConfigData lidar{5.0 * cm, 40.0 * cm, 2.0 * cm, 1};
+    MappingAlgorithmImpl algorithm{mission, lidar, droneConfig(), *output};
+
+    const types::MappingStepCommand command = algorithm.nextStep(
+        types::DroneState{current_position, makeHeading(0.0), 0}, nullptr);
+
+    EXPECT_FALSE(command.scan_orientation.has_value());
+    EXPECT_FALSE(command.movement.has_value());
+    EXPECT_EQ(command.status, types::AlgorithmStatus::FinishedWithUnmappableVoxels);
+}
+
+TEST(MappingAlgorithm, SkipsBaseDirectionsWithoutUsefulPotential) {
+    const types::MappingBounds mission_bounds = bounds(0.0, 55.0, 0.0, 55.0, 0.0, 55.0);
+    const types::MapConfig config = mapConfig(mission_bounds, 5.0);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Occupied);
+    const types::MissionConfigData mission{100, 5.0 * cm, 1.0, mission_bounds};
+    const types::DroneConfigData drone{
+        3.0 * cm,
+        90.0 * horizontal_angle[deg],
+        20.0 * cm,
+        20.0 * cm,
+    };
+    const types::LidarConfigData lidar{5.0 * cm, 25.0 * cm, 2.0 * cm, 1};
+    const Position3D current_position = pos(27.5, 27.5, 27.5);
+    output->set(current_position, types::VoxelOccupancy::Empty);
+
+    MappingAlgorithmImpl algorithm{mission, lidar, drone, *output};
+    const types::MappingStepCommand command =
+        algorithm.nextStep(types::DroneState{current_position, makeHeading(0.0), 0}, nullptr);
+
+    EXPECT_FALSE(command.scan_orientation.has_value());
+    EXPECT_FALSE(command.movement.has_value());
     EXPECT_NE(command.status, types::AlgorithmStatus::Working);
+}
+
+TEST(MappingAlgorithm, SkipsUselessBaseScansAndRoundRobinsAdaptiveScans) {
+    const types::MappingBounds mission_bounds = bounds(0.0, 55.0, 0.0, 55.0, 0.0, 55.0);
+    const types::MapConfig config = mapConfig(mission_bounds, 5.0);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Occupied);
+    const types::MissionConfigData mission{100, 5.0 * cm, 1.0, mission_bounds};
+    const types::DroneConfigData drone{
+        3.0 * cm,
+        90.0 * horizontal_angle[deg],
+        20.0 * cm,
+        20.0 * cm,
+    };
+    const types::LidarConfigData lidar{5.0 * cm, 25.0 * cm, 2.0 * cm, 1};
+    const Position3D current_position = pos(27.5, 27.5, 27.5);
+
+    output->set(current_position, types::VoxelOccupancy::Empty);
+    for (const Position3D& empty : std::vector<Position3D>{
+             pos(32.5, 27.5, 27.5),
+             pos(37.5, 27.5, 27.5),
+             pos(32.5, 22.5, 27.5),
+             pos(32.5, 32.5, 27.5),
+             pos(32.5, 27.5, 22.5),
+             pos(22.5, 27.5, 27.5),
+             pos(17.5, 27.5, 27.5),
+             pos(22.5, 22.5, 27.5),
+             pos(22.5, 32.5, 27.5),
+             pos(22.5, 27.5, 22.5),
+             pos(27.5, 22.5, 27.5),
+             pos(27.5, 32.5, 27.5),
+             pos(27.5, 27.5, 22.5),
+             pos(27.5, 27.5, 32.5),
+         }) {
+        output->set(empty, types::VoxelOccupancy::Empty);
+    }
+    const Position3D forward_blocker = pos(32.5, 27.5, 32.5);
+    const Position3D backward_blocker = pos(22.5, 27.5, 32.5);
+    output->set(forward_blocker, types::VoxelOccupancy::Unmapped);
+    output->set(backward_blocker, types::VoxelOccupancy::Unmapped);
+
+    MappingAlgorithmImpl algorithm{mission, lidar, drone, *output};
+    const types::DroneState state{current_position, makeHeading(0.0), 0};
+    const types::MappingStepCommand first_adaptive_scan = algorithm.nextStep(state, nullptr);
+    ASSERT_TRUE(first_adaptive_scan.scan_orientation.has_value());
+    EXPECT_FALSE(first_adaptive_scan.movement.has_value());
+    EXPECT_NEAR(
+        first_adaptive_scan.scan_orientation->horizontal.force_numerical_value_in(deg), 0.0, 1.0e-6);
+    EXPECT_NEAR(
+        first_adaptive_scan.scan_orientation->altitude.force_numerical_value_in(deg), 45.0, 1.0e-6);
+
+    const types::LidarScanResult latest_scan{
+        types::LidarHit{
+            std::numeric_limits<double>::max() * cm,
+            *first_adaptive_scan.scan_orientation,
+        },
+    };
+    const types::MappingStepCommand next_adaptive_scan = algorithm.nextStep(state, &latest_scan);
+    ASSERT_TRUE(next_adaptive_scan.scan_orientation.has_value());
+    EXPECT_NEAR(
+        next_adaptive_scan.scan_orientation->horizontal.force_numerical_value_in(deg), 180.0, 1.0e-6);
+    EXPECT_NEAR(
+        next_adaptive_scan.scan_orientation->altitude.force_numerical_value_in(deg), 45.0, 1.0e-6);
+
+    output->set(backward_blocker, types::VoxelOccupancy::Empty);
+    const types::MappingStepCommand next_command = algorithm.nextStep(state, nullptr);
+
+    ASSERT_TRUE(next_command.movement.has_value());
+    EXPECT_EQ(output->atVoxel(forward_blocker), types::VoxelOccupancy::Unmapped);
+}
+
+TEST(MappingAlgorithm, ScanDirectionsAreRelativeToDroneHeading) {
+    const types::MapConfig config = mapConfig(bounds(0.0, 50.0, 0.0, 50.0, 0.0, 50.0), 5.0);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Occupied);
+    const types::MissionConfigData mission{
+        20,
+        5.0 * cm,
+        1.0,
+        config.boundaries,
+    };
+    output->set(pos(22.5, 22.5, 22.5), types::VoxelOccupancy::Empty);
+    for (double y = 27.5; y < 50.0; y += 5.0) {
+        output->set(pos(22.5, y, 22.5), types::VoxelOccupancy::Unmapped);
+    }
+    MappingAlgorithmImpl algorithm{mission, lidarConfig(), droneConfig(), *output};
+
+    const types::MappingStepCommand command = algorithm.nextStep(
+        types::DroneState{pos(22.5, 22.5, 22.5), makeHeading(90.0), 0}, nullptr);
+
+    ASSERT_TRUE(command.scan_orientation.has_value());
+    EXPECT_NEAR(command.scan_orientation->horizontal.force_numerical_value_in(deg), 0.0, 1.0e-6);
 }
 
 TEST(MockLidar, CenterBeamDetectsObstacleNearMaximumRange) {
