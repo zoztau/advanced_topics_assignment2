@@ -32,6 +32,9 @@ public:
                                                      const types::LidarScanResult* latest_scan) override;
 
 private:
+    using BaseScanAttempt = std::tuple<long long, int, int, int>;
+    using AdaptiveScanAttempt = std::tuple<long long, long long, long long, long long>;
+
     struct SafetyAnalysis {
         bool hard_blocked = false;
         std::vector<GridIndex> unresolved{};
@@ -39,6 +42,13 @@ private:
         [[nodiscard]] bool safe() const {
             return !hard_blocked && unresolved.empty();
         }
+    };
+
+    struct ScanPlan {
+        Orientation orientation{};
+        std::optional<BaseScanAttempt> base_attempt{};
+        std::optional<AdaptiveScanAttempt> adaptive_attempt{};
+        std::size_t next_adaptive_candidate_cursor = 0;
     };
 
     [[nodiscard]] bool usesLeanScanPattern() const;
@@ -75,6 +85,10 @@ private:
         const types::DroneState& state,
         const GridIndex& current,
         const GridIndex& target);
+    [[nodiscard]] std::optional<ScanPlan> nextScanPlanForCell(
+        const GridIndex& current,
+        const types::DroneState& state) const;
+    [[nodiscard]] bool hasAvailableMappingAction(const GridIndex& index) const;
     [[nodiscard]] std::optional<Orientation> takeNextScanForCell(
         const GridIndex& current,
         const types::DroneState& state);
@@ -83,8 +97,8 @@ private:
     std::deque<GridIndex> branch_targets_{};
     std::optional<GridIndex> pending_target_{};
     std::set<long long> scanned_cells_{};
-    std::set<std::tuple<long long, int, int, int>> attempted_base_scans_{};
-    std::set<std::tuple<long long, long long, long long, long long>> attempted_adaptive_rays_{};
+    std::set<BaseScanAttempt> attempted_base_scans_{};
+    std::set<AdaptiveScanAttempt> attempted_adaptive_rays_{};
     std::map<long long, std::size_t> adaptive_scan_counts_{};
     std::map<long long, std::size_t> adaptive_candidate_cursors_{};
     std::set<long long> visited_cells_{};

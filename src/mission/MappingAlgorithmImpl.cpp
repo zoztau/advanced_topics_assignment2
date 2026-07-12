@@ -596,6 +596,9 @@ MappingAlgorithmImpl::chooseLocalMove(const GridIndex& current, Orientation head
         if (visited_cells_.contains(flatKey(candidate))) {
             continue;
         }
+        if (!hasAvailableMappingAction(candidate)) {
+            continue;
+        }
         const double score = coverageScore(candidate) + 0.25 * clearanceScore(candidate);
         if (score > best_score) {
             best_score = score;
@@ -611,7 +614,8 @@ MappingAlgorithmImpl::pathToQueuedBranchTarget(const GridIndex& current) const {
     std::set<long long> active_branch_targets;
     for (const GridIndex& target : branch_targets_) {
         const long long key = flatKey(target);
-        if (!visited_cells_.contains(key) && isKnownSafe(target, current)) {
+        if (!visited_cells_.contains(key) && isKnownSafe(target, current) &&
+            hasAvailableMappingAction(target)) {
             active_branch_targets.insert(key);
         }
     }
@@ -686,7 +690,7 @@ MappingAlgorithmImpl::pathToBestCoverageTarget(const GridIndex& current) const {
             branch_target_keys_.contains(node_key) && !visited_cells_.contains(node_key) ? 25.0 : 0.0;
         const double score =
             coverageScore(node) + 1.25 * clearanceScore(node) + branch_bonus - 0.35 * static_cast<double>(distance);
-        if (!sameCell(node, current) && score > best_score) {
+        if (!sameCell(node, current) && hasAvailableMappingAction(node) && score > best_score) {
             best_score = score;
             best = node;
         }
@@ -797,9 +801,9 @@ std::optional<types::MappingStepCommand> MappingAlgorithmImpl::commandTowardTarg
     return workingCommand(advanceCommand(step_distance * cm));
 }
 
-std::optional<Orientation> MappingAlgorithmImpl::takeNextScanForCell(
+std::optional<MappingAlgorithmImpl::ScanPlan> MappingAlgorithmImpl::nextScanPlanForCell(
     const GridIndex& current,
-    const types::DroneState& state) {
+    const types::DroneState& state) const {
     const long long key = flatKey(current);
     if ((!scanned_cells_.contains(key) && scanned_cells_.size() >= maxScannedCells()) ||
         lidar_config_.fov_circles == 0 || lengthCm(lidar_config_.z_max) <= 0.0) {
@@ -841,12 +845,16 @@ std::optional<Orientation> MappingAlgorithmImpl::takeNextScanForCell(
 
     if (!useful_base_directions.empty()) {
         const Direction direction = useful_base_directions.front().first;
-        attempted_base_scans_.insert(std::make_tuple(key, direction.dx, direction.dy, direction.dz));
-        scanned_cells_.insert(key);
-        return scanOrientationForDirection(direction, state.heading);
+        ScanPlan plan{};
+        plan.orientation = scanOrientationForDirection(direction, state.heading);
+        plan.base_attempt = std::make_tuple(key, direction.dx, direction.dy, direction.dz);
+        return plan;
     }
 
-    std::size_t& adaptive_scan_count = adaptive_scan_counts_[key];
+    std::size_t adaptive_scan_count = 0;
+    if (const auto count = adaptive_scan_counts_.find(key); count != adaptive_scan_counts_.end()) {
+        adaptive_scan_count = count->second;
+    }
     if (mission_config_.max_steps == 0 &&
         adaptive_scan_count >= kMaxAdaptiveScansWithoutStepLimit) {
         return std::nullopt;
@@ -863,7 +871,11 @@ std::optional<Orientation> MappingAlgorithmImpl::takeNextScanForCell(
     const types::MapConfig config = output_map_.getMapConfig();
     const double lidar_range = lengthCm(lidar_config_.z_max);
     const double lidar_range_squared = lidar_range * lidar_range;
-    std::size_t& candidate_cursor = adaptive_candidate_cursors_[key];
+    std::size_t candidate_cursor = 0;
+    if (const auto cursor = adaptive_candidate_cursors_.find(key);
+        cursor != adaptive_candidate_cursors_.end()) {
+        candidate_cursor = cursor->second;
+    }
     candidate_cursor %= candidate_directions.size();
 
     for (std::size_t offset = 0; offset < candidate_directions.size(); ++offset) {
@@ -903,15 +915,51 @@ std::optional<Orientation> MappingAlgorithmImpl::takeNextScanForCell(
                 continue;
             }
 
-            attempted_adaptive_rays_.insert(attempt);
-            ++adaptive_scan_count;
-            candidate_cursor = (candidate_index + 1U) % candidate_directions.size();
-            scanned_cells_.insert(key);
-            return scanOrientationToward(target, state);
+            ScanPlan plan{};
+            plan.orientation = scanOrientationToward(target, state);
+            plan.adaptive_attempt = attempt;
+            plan.next_adaptive_candidate_cursor =
+                (candidate_index + 1U) % candidate_directions.size();
+            return plan;
         }
     }
 
     return std::nullopt;
+}
+
+bool MappingAlgorithmImpl::hasAvailableMappingAction(const GridIndex& index) const {
+    if (!inGrid(index) ||
+        output_map_.atVoxel(cellCenter(index)) != types::VoxelOccupancy::Empty) {
+        return false;
+    }
+
+    const types::DroneState projected_state{
+        cellCenter(index),
+        Orientation{0.0 * horizontal_angle[deg], 0.0 * altitude_angle[deg]},
+        0,
+    };
+    return nextScanPlanForCell(index, projected_state).has_value();
+}
+
+std::optional<Orientation> MappingAlgorithmImpl::takeNextScanForCell(
+    const GridIndex& current,
+    const types::DroneState& state) {
+    const std::optional<ScanPlan> plan = nextScanPlanForCell(current, state);
+    if (!plan.has_value()) {
+        return std::nullopt;
+    }
+
+    const long long key = flatKey(current);
+    if (plan->base_attempt.has_value()) {
+        attempted_base_scans_.insert(*plan->base_attempt);
+    }
+    if (plan->adaptive_attempt.has_value()) {
+        attempted_adaptive_rays_.insert(*plan->adaptive_attempt);
+        ++adaptive_scan_counts_[key];
+        adaptive_candidate_cursors_[key] = plan->next_adaptive_candidate_cursor;
+    }
+    scanned_cells_.insert(key);
+    return plan->orientation;
 }
 
 void MappingAlgorithmImpl::rememberBranchTargets(const GridIndex& current) {
