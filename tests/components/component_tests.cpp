@@ -157,6 +157,45 @@ public:
     std::size_t step_calls = 0;
 };
 
+class PositionedDroneControl final : public IDroneControl {
+public:
+    explicit PositionedDroneControl(Position3D position,
+                                    types::DroneStepResult step_result = {
+                                        types::DroneStepStatus::Completed, {}})
+        : position_(position),
+          step_result_(std::move(step_result)) {}
+
+    types::DroneStepResult step() override {
+        ++step_calls;
+        return step_result_;
+    }
+
+    types::DroneState state() const override {
+        return types::DroneState{position_, makeHeading(0.0), step_calls};
+    }
+
+    std::size_t step_calls = 0;
+
+private:
+    Position3D position_{};
+    types::DroneStepResult step_result_{};
+};
+
+[[nodiscard]] std::filesystem::path freshMissionTestDirectory(const std::string& name) {
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / name;
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    return directory;
+}
+
+[[nodiscard]] std::string readTextFile(const std::filesystem::path& path) {
+    std::ifstream input{path};
+    std::string contents;
+    std::getline(input, contents, '\0');
+    return contents;
+}
+
 class ScriptedAlgorithm final : public IMappingAlgorithm {
 public:
     ScriptedAlgorithm(const types::MissionConfigData& mission,
@@ -365,6 +404,120 @@ TEST(MissionControl, ReportsMaxStepsAfterExactConfiguredNumberOfCalls) {
     EXPECT_EQ(result.status, types::MissionRunStatus::MaxSteps);
     EXPECT_EQ(result.steps, mission_config.max_steps);
     EXPECT_EQ(drone_control.step_calls, mission_config.max_steps);
+}
+
+TEST(MissionControl, RejectsInitialSphereOverlappingAdjacentOccupiedVoxel) {
+    const types::MappingBounds test_bounds = bounds(0.0, 40.0, 0.0, 40.0, 0.0, 40.0);
+    const types::MapConfig config = mapConfig(test_bounds, 10.0);
+    auto hidden = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Empty);
+    hidden->set(pos(15.0, 15.0, 15.0), types::VoxelOccupancy::Occupied);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Unmapped);
+    types::MissionConfigData mission_config = missionConfig();
+    mission_config.mission_bounds = test_bounds;
+    types::DroneConfigData drone_config = droneConfig();
+    drone_config.radius = 2.0 * cm;
+    PositionedDroneControl drone_control{pos(8.5, 15.0, 15.0)};
+    const std::filesystem::path directory =
+        freshMissionTestDirectory("mission_control_initial_sphere_overlap");
+    const std::filesystem::path output_file = directory / "output.npy";
+    MissionControlImpl mission{
+        mission_config, drone_config, *hidden, *output, drone_control, output_file};
+
+    const types::MissionRunResult result = mission.runMission();
+
+    ASSERT_EQ(result.status, types::MissionRunStatus::Error);
+    ASSERT_EQ(result.errors.size(), 1U);
+    EXPECT_EQ(result.errors.front().code, "INVALID_INITIAL_POSITION");
+    EXPECT_EQ(result.steps, 0U);
+    EXPECT_EQ(drone_control.step_calls, 0U);
+    EXPECT_TRUE(std::filesystem::exists(output_file));
+    EXPECT_THAT(readTextFile(directory / "errors.log"),
+                testing::HasSubstr("code=INVALID_INITIAL_POSITION"));
+}
+
+TEST(MissionControl, RejectsInitialSphereOutsideMissionBounds) {
+    const types::MappingBounds hidden_bounds = bounds(0.0, 40.0, 0.0, 40.0, 0.0, 40.0);
+    const types::MappingBounds mission_bounds = bounds(5.0, 35.0, 5.0, 35.0, 5.0, 35.0);
+    auto hidden = Map3DImpl::createEmpty(
+        mapConfig(hidden_bounds, 10.0), types::VoxelOccupancy::Empty);
+    auto output = Map3DImpl::createEmpty(
+        mapConfig(mission_bounds, 10.0), types::VoxelOccupancy::Unmapped);
+    types::MissionConfigData mission_config = missionConfig();
+    mission_config.mission_bounds = mission_bounds;
+    types::DroneConfigData drone_config = droneConfig();
+    drone_config.radius = 2.0 * cm;
+    PositionedDroneControl drone_control{pos(6.0, 20.0, 20.0)};
+    const std::filesystem::path directory =
+        freshMissionTestDirectory("mission_control_initial_sphere_mission_bounds");
+    const std::filesystem::path output_file = directory / "output.npy";
+    MissionControlImpl mission{
+        mission_config, drone_config, *hidden, *output, drone_control, output_file};
+
+    const types::MissionRunResult result = mission.runMission();
+
+    ASSERT_EQ(result.status, types::MissionRunStatus::Error);
+    ASSERT_EQ(result.errors.size(), 1U);
+    EXPECT_EQ(result.errors.front().code, "INVALID_INITIAL_POSITION");
+    EXPECT_EQ(result.steps, 0U);
+    EXPECT_EQ(drone_control.step_calls, 0U);
+    EXPECT_TRUE(std::filesystem::exists(output_file));
+    EXPECT_THAT(readTextFile(directory / "errors.log"),
+                testing::HasSubstr("code=INVALID_INITIAL_POSITION"));
+}
+
+TEST(MissionControl, RejectsInitialSphereOutsideHiddenMapBounds) {
+    const types::MappingBounds hidden_bounds = bounds(0.0, 40.0, 0.0, 40.0, 0.0, 40.0);
+    const types::MappingBounds mission_bounds = bounds(-10.0, 50.0, -10.0, 50.0, -10.0, 50.0);
+    auto hidden = Map3DImpl::createEmpty(
+        mapConfig(hidden_bounds, 10.0), types::VoxelOccupancy::Empty);
+    auto output = Map3DImpl::createEmpty(
+        mapConfig(mission_bounds, 10.0), types::VoxelOccupancy::Unmapped);
+    types::MissionConfigData mission_config = missionConfig();
+    mission_config.mission_bounds = mission_bounds;
+    types::DroneConfigData drone_config = droneConfig();
+    drone_config.radius = 2.0 * cm;
+    PositionedDroneControl drone_control{pos(1.0, 20.0, 20.0)};
+    const std::filesystem::path directory =
+        freshMissionTestDirectory("mission_control_initial_sphere_hidden_bounds");
+    const std::filesystem::path output_file = directory / "output.npy";
+    MissionControlImpl mission{
+        mission_config, drone_config, *hidden, *output, drone_control, output_file};
+
+    const types::MissionRunResult result = mission.runMission();
+
+    ASSERT_EQ(result.status, types::MissionRunStatus::Error);
+    ASSERT_EQ(result.errors.size(), 1U);
+    EXPECT_EQ(result.errors.front().code, "INVALID_INITIAL_POSITION");
+    EXPECT_EQ(result.steps, 0U);
+    EXPECT_EQ(drone_control.step_calls, 0U);
+    EXPECT_TRUE(std::filesystem::exists(output_file));
+    EXPECT_THAT(readTextFile(directory / "errors.log"),
+                testing::HasSubstr("code=INVALID_INITIAL_POSITION"));
+}
+
+TEST(MissionControl, AcceptsFullyClearInitialSphereInsideAllBounds) {
+    const types::MappingBounds test_bounds = bounds(0.0, 40.0, 0.0, 40.0, 0.0, 40.0);
+    const types::MapConfig config = mapConfig(test_bounds, 10.0);
+    auto hidden = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Empty);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Unmapped);
+    types::MissionConfigData mission_config = missionConfig();
+    mission_config.mission_bounds = test_bounds;
+    types::DroneConfigData drone_config = droneConfig();
+    drone_config.radius = 2.0 * cm;
+    PositionedDroneControl drone_control{pos(5.0, 15.0, 15.0)};
+    const std::filesystem::path directory =
+        freshMissionTestDirectory("mission_control_initial_sphere_clear");
+    const std::filesystem::path output_file = directory / "output.npy";
+    MissionControlImpl mission{
+        mission_config, drone_config, *hidden, *output, drone_control, output_file};
+
+    const types::MissionRunResult result = mission.runMission();
+
+    EXPECT_EQ(result.status, types::MissionRunStatus::Completed);
+    EXPECT_EQ(result.steps, 1U);
+    EXPECT_EQ(drone_control.step_calls, 1U);
+    EXPECT_TRUE(std::filesystem::exists(output_file));
+    EXPECT_FALSE(std::filesystem::exists(directory / "errors.log"));
 }
 
 TEST(DroneControl, FirstStepPassesNullScanAndAppliesLidarMiss) {

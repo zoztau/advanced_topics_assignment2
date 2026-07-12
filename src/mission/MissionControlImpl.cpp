@@ -1,11 +1,140 @@
 #include <drone_mapper/MissionControlImpl.h>
 
+#include <geometry/VoxelGeometry.h>
+
+#include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <string>
 #include <utility>
 
 namespace drone_mapper {
 namespace {
+
+constexpr double kCollisionEpsilon = 1.0e-6;
+
+struct AxisIndexRange {
+    int first = 1;
+    int last = 0;
+
+    [[nodiscard]] bool empty() const {
+        return first > last;
+    }
+};
+
+[[nodiscard]] double xCm(XLength value) {
+    return value.force_numerical_value_in(cm);
+}
+
+[[nodiscard]] double yCm(YLength value) {
+    return value.force_numerical_value_in(cm);
+}
+
+[[nodiscard]] double zCm(ZLength value) {
+    return value.force_numerical_value_in(cm);
+}
+
+[[nodiscard]] double lengthCm(PhysicalLength value) {
+    return value.force_numerical_value_in(cm);
+}
+
+[[nodiscard]] int dimensionFromSpan(double min_value, double max_value, double resolution) {
+    if (resolution <= 0.0 || max_value <= min_value) {
+        return 0;
+    }
+    return static_cast<int>(std::ceil((max_value - min_value) / resolution));
+}
+
+[[nodiscard]] AxisIndexRange candidateRange(double center,
+                                            double radius,
+                                            double map_min,
+                                            double map_max,
+                                            double resolution) {
+    const int dimension = dimensionFromSpan(map_min, map_max, resolution);
+    if (dimension == 0) {
+        return {};
+    }
+
+    const int first = static_cast<int>(std::floor((center - radius - map_min) / resolution)) - 1;
+    const int last = static_cast<int>(std::floor((center + radius - map_min) / resolution)) + 1;
+    return AxisIndexRange{
+        std::max(0, first),
+        std::min(dimension - 1, last),
+    };
+}
+
+[[nodiscard]] bool sphereFitsBounds(const Position3D& center,
+                                    double radius,
+                                    const types::MappingBounds& bounds) {
+    return xCm(center.x) - radius >= xCm(bounds.min_x) &&
+           xCm(center.x) + radius < xCm(bounds.max_x) &&
+           yCm(center.y) - radius >= yCm(bounds.min_y) &&
+           yCm(center.y) + radius < yCm(bounds.max_y) &&
+           zCm(center.z) - radius >= zCm(bounds.min_height) &&
+           zCm(center.z) + radius < zCm(bounds.max_height);
+}
+
+[[nodiscard]] double clippedMidpoint(double voxel_min,
+                                     double voxel_max,
+                                     double map_min,
+                                     double map_max) {
+    const double clipped_min = std::max(voxel_min, map_min);
+    const double clipped_max = std::min(voxel_max, map_max);
+    return clipped_min + (clipped_max - clipped_min) * 0.5;
+}
+
+[[nodiscard]] Position3D voxelProbe(const geometry::VoxelAabb& box,
+                                    const types::MappingBounds& bounds) {
+    return Position3D{
+        clippedMidpoint(box.min[0], box.max[0], xCm(bounds.min_x), xCm(bounds.max_x)) * x_extent[cm],
+        clippedMidpoint(box.min[1], box.max[1], yCm(bounds.min_y), yCm(bounds.max_y)) * y_extent[cm],
+        clippedMidpoint(box.min[2], box.max[2], zCm(bounds.min_height), zCm(bounds.max_height)) *
+            z_extent[cm],
+    };
+}
+
+[[nodiscard]] bool initialSphereIsValid(const Position3D& center,
+                                        PhysicalLength drone_radius,
+                                        const types::MappingBounds& mission_bounds,
+                                        const IMap3D& hidden_map) {
+    const double radius = std::max(0.0, lengthCm(drone_radius));
+    const types::MapConfig config = hidden_map.getMapConfig();
+    const double resolution = lengthCm(config.resolution);
+    if (resolution <= 0.0 || !hidden_map.isInBounds(center) ||
+        !sphereFitsBounds(center, radius, mission_bounds) ||
+        !sphereFitsBounds(center, radius, config.boundaries)) {
+        return false;
+    }
+
+    const AxisIndexRange x_range = candidateRange(
+        xCm(center.x), radius,
+        xCm(config.boundaries.min_x), xCm(config.boundaries.max_x), resolution);
+    const AxisIndexRange y_range = candidateRange(
+        yCm(center.y), radius,
+        yCm(config.boundaries.min_y), yCm(config.boundaries.max_y), resolution);
+    const AxisIndexRange z_range = candidateRange(
+        zCm(center.z), radius,
+        zCm(config.boundaries.min_height), zCm(config.boundaries.max_height), resolution);
+    if (x_range.empty() || y_range.empty() || z_range.empty()) {
+        return false;
+    }
+
+    for (int x = x_range.first; x <= x_range.last; ++x) {
+        for (int y = y_range.first; y <= y_range.last; ++y) {
+            for (int z = z_range.first; z <= z_range.last; ++z) {
+                const geometry::VoxelAabb box = geometry::voxelAabb(config, x, y, z);
+                if (hidden_map.atVoxel(voxelProbe(box, config.boundaries)) ==
+                        types::VoxelOccupancy::Occupied &&
+                    geometry::squaredDistanceToVoxelAabb(center, x, y, z, config) <=
+                        radius * radius + kCollisionEpsilon) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
 
 [[nodiscard]] std::filesystem::path errorLogPath(const std::filesystem::path& output_map_file) {
     return output_map_file.parent_path() / "errors.log";
@@ -68,11 +197,11 @@ MissionControlImpl::MissionControlImpl(types::MissionConfigData mission,
 
 types::MissionRunResult MissionControlImpl::runMission() {
     const Position3D start_position = drone_control_.state().position;
-    if (!hidden_map_.isInBounds(start_position) ||
-        hidden_map_.atVoxel(start_position) == types::VoxelOccupancy::Occupied) {
+    if (!initialSphereIsValid(
+            start_position, drone_.radius, mission_.mission_bounds, hidden_map_)) {
         const types::ErrorRef error{
             "INVALID_INITIAL_POSITION",
-            "Initial drone position is outside the hidden map or occupied."};
+            "Initial drone sphere is outside mission or hidden-map bounds, or intersects an occupied voxel."};
         logErrorImmediately(output_map_file_, error, 0);
         output_map_.save(output_map_file_);
         return result(types::MissionRunStatus::Error, 0, {error});
