@@ -1048,6 +1048,61 @@ TEST(MappingAlgorithm, SkipsUselessBaseScansAndRoundRobinsAdaptiveScans) {
     EXPECT_EQ(output->atVoxel(forward_blocker), types::VoxelOccupancy::Unmapped);
 }
 
+TEST(MappingAlgorithm, TargetsVisibleUnresolvedSurfaceThatDoesNotBlockMovement) {
+    const types::MappingBounds mission_bounds = bounds(0.0, 55.0, 0.0, 55.0, 0.0, 55.0);
+    const types::MapConfig config = mapConfig(mission_bounds, 5.0);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Occupied);
+    const types::MissionConfigData mission{100, 5.0 * cm, 1.0, mission_bounds};
+    const types::DroneConfigData drone{
+        1.0 * cm,
+        90.0 * horizontal_angle[deg],
+        20.0 * cm,
+        20.0 * cm,
+    };
+    const types::LidarConfigData lidar{5.0 * cm, 25.0 * cm, 2.0 * cm, 1};
+    const Position3D current_position = pos(27.5, 27.5, 17.5);
+    const std::vector<Position3D> safe_neighbors{
+        pos(32.5, 27.5, 17.5),
+        pos(22.5, 27.5, 17.5),
+        pos(27.5, 32.5, 17.5),
+        pos(27.5, 22.5, 17.5),
+        pos(27.5, 27.5, 22.5),
+        pos(27.5, 27.5, 12.5),
+    };
+    const Position3D unresolved_floor = pos(37.5, 32.5, 2.5);
+
+    output->set(current_position, types::VoxelOccupancy::Empty);
+    for (const Position3D& neighbor : safe_neighbors) {
+        output->set(neighbor, types::VoxelOccupancy::Empty);
+    }
+    for (const Position3D& visible_path_cell : std::vector<Position3D>{
+             pos(32.5, 27.5, 12.5),
+             pos(32.5, 32.5, 7.5),
+             pos(37.5, 32.5, 7.5),
+         }) {
+        output->set(visible_path_cell, types::VoxelOccupancy::Empty);
+    }
+
+    MappingAlgorithmImpl algorithm{mission, lidar, drone, *output};
+    for (const Position3D& neighbor : safe_neighbors) {
+        const types::MappingStepCommand visit_command = algorithm.nextStep(
+            types::DroneState{neighbor, makeHeading(0.0), 0}, nullptr);
+        EXPECT_NE(visit_command.status, types::AlgorithmStatus::Working);
+    }
+    output->set(unresolved_floor, types::VoxelOccupancy::Unmapped);
+
+    const types::MappingStepCommand command = algorithm.nextStep(
+        types::DroneState{current_position, makeHeading(0.0), 0}, nullptr);
+
+    ASSERT_TRUE(command.scan_orientation.has_value());
+    EXPECT_FALSE(command.movement.has_value());
+    EXPECT_EQ(command.status, types::AlgorithmStatus::Working);
+    EXPECT_NEAR(
+        command.scan_orientation->horizontal.force_numerical_value_in(deg), 26.565051, 1.0e-5);
+    EXPECT_NEAR(
+        command.scan_orientation->altitude.force_numerical_value_in(deg), -53.300775, 1.0e-5);
+}
+
 TEST(MappingAlgorithm, ScanDirectionsAreRelativeToDroneHeading) {
     const types::MapConfig config = mapConfig(bounds(0.0, 50.0, 0.0, 50.0, 0.0, 50.0), 5.0);
     auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Occupied);

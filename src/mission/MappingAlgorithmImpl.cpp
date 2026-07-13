@@ -22,6 +22,8 @@ constexpr std::size_t kConservativeScanCellLimit = 80;
 constexpr std::size_t kLeanScanCellLimit = 1000;
 constexpr std::size_t kMaxBfsCells = 6000;
 constexpr std::size_t kMaxAdaptiveScansWithoutStepLimit = 512;
+constexpr std::size_t kMaxGeneralAdaptiveVoxelChecks = 4096;
+constexpr std::size_t kMaxGeneralAdaptiveCandidates = 512;
 constexpr double kRayKeyScale = 1.0e9;
 constexpr double kScanDistanceWeightDecay = 0.12;
 constexpr double kMinimumUsefulPotentialFraction = 0.05;
@@ -908,6 +910,120 @@ std::optional<MappingAlgorithmImpl::ScanPlan> MappingAlgorithmImpl::nextScanPlan
             plan.next_adaptive_candidate_cursor =
                 (candidate_index + 1U) % candidate_directions.size();
             return plan;
+        }
+    }
+
+    const double resolution = lengthCm(config.resolution);
+    if (resolution <= 0.0) {
+        return std::nullopt;
+    }
+
+    const auto targetIsVisible = [&](const GridIndex& target) {
+        const Position3D target_center = cellCenter(target);
+        const double dx = xCm(target_center.x) - xCm(state.position.x);
+        const double dy = yCm(target_center.y) - yCm(state.position.y);
+        const double dz = zCm(target_center.z) - zCm(state.position.z);
+        const double target_distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (target_distance <= kEpsilon) {
+            return false;
+        }
+
+        const double ray_distance = std::min(target_distance, lidar_range);
+        const double sample_step = 0.5 * resolution;
+        const int samples = std::max(1, static_cast<int>(std::ceil(ray_distance / sample_step)));
+        for (int sample = 1; sample <= samples; ++sample) {
+            const double distance = std::min(static_cast<double>(sample) * sample_step, ray_distance);
+            const double scale = distance / target_distance;
+            const Position3D sample_position{
+                (xCm(state.position.x) + dx * scale) * x_extent[cm],
+                (yCm(state.position.y) + dy * scale) * y_extent[cm],
+                (zCm(state.position.z) + dz * scale) * z_extent[cm],
+            };
+            const GridIndex sample_index = gridFromPosition(sample_position);
+            if (!inGrid(sample_index)) {
+                return false;
+            }
+            if (sameCell(sample_index, target)) {
+                return true;
+            }
+            if (output_map_.atVoxel(cellCenter(sample_index)) ==
+                types::VoxelOccupancy::Occupied) {
+                return false;
+            }
+        }
+        return false;
+    };
+
+    const int max_target_offset =
+        std::max(1, static_cast<int>(std::ceil(lidar_range / resolution)) + 1);
+    std::size_t checked_voxels = 0;
+    std::size_t checked_candidates = 0;
+    for (int shell = 1; shell <= max_target_offset; ++shell) {
+        for (int dx = -shell; dx <= shell; ++dx) {
+            for (int dy = -shell; dy <= shell; ++dy) {
+                for (int dz = -shell; dz <= shell; ++dz) {
+                    if (std::max({std::abs(dx), std::abs(dy), std::abs(dz)}) != shell) {
+                        continue;
+                    }
+
+                    const GridIndex candidate{current.x + dx, current.y + dy, current.z + dz};
+                    if (!inGrid(candidate)) {
+                        continue;
+                    }
+                    if (++checked_voxels > kMaxGeneralAdaptiveVoxelChecks) {
+                        return std::nullopt;
+                    }
+
+                    const types::VoxelOccupancy occupancy =
+                        output_map_.atVoxel(cellCenter(candidate));
+                    if (occupancy != types::VoxelOccupancy::Unmapped &&
+                        occupancy != types::VoxelOccupancy::PotentiallyOccupied) {
+                        continue;
+                    }
+                    if (++checked_candidates > kMaxGeneralAdaptiveCandidates) {
+                        return std::nullopt;
+                    }
+                    if (geometry::squaredDistanceToVoxelAabb(
+                            state.position, candidate.x, candidate.y, candidate.z, config) >
+                        lidar_range_squared + kEpsilon) {
+                        continue;
+                    }
+
+                    const int nonzero_axes =
+                        static_cast<int>(dx != 0) + static_cast<int>(dy != 0) +
+                        static_cast<int>(dz != 0);
+                    if (nonzero_axes == 1) {
+                        const Direction axis_direction{
+                            (dx > 0) - (dx < 0),
+                            (dy > 0) - (dy < 0),
+                            (dz > 0) - (dz < 0),
+                        };
+                        const BaseScanAttempt base_attempt = std::make_tuple(
+                            key, axis_direction.dx, axis_direction.dy, axis_direction.dz);
+                        if (attempted_base_scans_.contains(base_attempt)) {
+                            continue;
+                        }
+                    }
+
+                    const Position3D target = cellCenter(candidate);
+                    const auto direction_key = normalizedRayKey(target, state.position);
+                    if (!direction_key.has_value()) {
+                        continue;
+                    }
+                    const auto [ray_x, ray_y, ray_z] = *direction_key;
+                    const auto attempt = std::make_tuple(key, ray_x, ray_y, ray_z);
+                    if (attempted_adaptive_rays_.contains(attempt) ||
+                        !targetIsVisible(candidate)) {
+                        continue;
+                    }
+
+                    ScanPlan plan{};
+                    plan.orientation = scanOrientationToward(target, state);
+                    plan.adaptive_attempt = attempt;
+                    plan.next_adaptive_candidate_cursor = candidate_cursor;
+                    return plan;
+                }
+            }
         }
     }
 
