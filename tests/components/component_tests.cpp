@@ -23,6 +23,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -122,6 +123,27 @@ public:
 private:
     const IMap3D& map_;
     double far_x_cm_ = 0.0;
+};
+
+class ThrowingComparisonMap final : public IMap3D {
+public:
+    explicit ThrowingComparisonMap(types::MapConfig config)
+        : config_(std::move(config)) {}
+
+    types::VoxelOccupancy atVoxel(const Position3D&) const override {
+        throw std::runtime_error("deterministic comparison failure");
+    }
+
+    types::MapConfig getMapConfig() const override {
+        return config_;
+    }
+
+    bool isInBounds(const Position3D&) const override {
+        return true;
+    }
+
+private:
+    types::MapConfig config_{};
 };
 
 class StaticRun final : public ISimulationRun {
@@ -340,6 +362,13 @@ public:
     bool called = false;
 };
 
+class ThrowingMissionControl final : public IMissionControl {
+public:
+    types::MissionRunResult runMission() override {
+        throw std::runtime_error("deterministic mission failure");
+    }
+};
+
 } // namespace
 
 TEST(SimulationManager, ExpandsCartesianProductAndWritesReport) {
@@ -390,6 +419,103 @@ TEST(SimulationRun, CallsMissionAndScoresCompletedMap) {
     ASSERT_EQ(result.mission_results.size(), 1U);
     EXPECT_EQ(result.mission_results.front().status, types::MissionRunStatus::Completed);
     EXPECT_DOUBLE_EQ(result.mission_score, 100.0);
+}
+
+TEST(SimulationRun, LogsCaughtMissionExceptionImmediately) {
+    const types::MapConfig config = mapConfig(bounds(0.0, 20.0, 0.0, 20.0, 0.0, 20.0), 10.0);
+    auto hidden = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Empty);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Empty);
+    auto output_for_algorithm = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Empty);
+    const std::filesystem::path temporary =
+        std::filesystem::temp_directory_path() / "simulation_run_exception_logging_test";
+    std::filesystem::remove_all(temporary);
+    const std::filesystem::path output_map_file =
+        temporary / "output_results" / "run_000" / "output_map.npy";
+    const std::filesystem::path error_log = output_map_file.parent_path() / "errors.log";
+
+    SimulationRunImpl run{
+        std::move(hidden),
+        std::move(output),
+        std::make_unique<NullGPS>(),
+        std::make_unique<NullMovement>(),
+        std::make_unique<NullLidar>(),
+        std::make_unique<NullAlgorithm>(*output_for_algorithm),
+        std::make_unique<NullDroneControl>(),
+        std::make_unique<ThrowingMissionControl>(),
+        types::SimulationConfigData{},
+        missionConfig(),
+        types::ResolutionRequestStatus::Accepted,
+        output_map_file,
+    };
+
+    const types::SimulationResult result = run.run();
+
+    ASSERT_EQ(result.mission_results.size(), 1U);
+    const types::MissionRunResult& mission_result = result.mission_results.front();
+    EXPECT_EQ(mission_result.status, types::MissionRunStatus::Error);
+    EXPECT_DOUBLE_EQ(result.mission_score, -1.0);
+    ASSERT_EQ(mission_result.errors.size(), 1U);
+    EXPECT_EQ(mission_result.errors.front().code, "SIMULATION_RUN_ERROR");
+    EXPECT_EQ(mission_result.errors.front().message, "deterministic mission failure");
+    ASSERT_TRUE(std::filesystem::exists(error_log));
+    const std::string log_contents = readTextFile(error_log);
+    EXPECT_THAT(
+        log_contents,
+        testing::HasSubstr(
+            "step=0 code=SIMULATION_RUN_ERROR message=\"deterministic mission failure\""));
+    std::filesystem::remove_all(temporary);
+}
+
+TEST(SimulationRun, ReplacesCompletedMissionResultWhenComparisonThrows) {
+    const types::MapConfig config = mapConfig(bounds(0.0, 10.0, 0.0, 10.0, 0.0, 10.0), 10.0);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Empty);
+    auto output_for_algorithm = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Empty);
+    auto mission = std::make_unique<CompletedMission>();
+    CompletedMission* mission_ptr = mission.get();
+    const std::filesystem::path temporary =
+        std::filesystem::temp_directory_path() / "simulation_run_comparison_exception_test";
+    std::filesystem::remove_all(temporary);
+    const std::filesystem::path output_map_file =
+        temporary / "output_results" / "run_000" / "output_map.npy";
+    const std::filesystem::path error_log = output_map_file.parent_path() / "errors.log";
+
+    SimulationRunImpl run{
+        std::make_unique<ThrowingComparisonMap>(config),
+        std::move(output),
+        std::make_unique<NullGPS>(),
+        std::make_unique<NullMovement>(),
+        std::make_unique<NullLidar>(),
+        std::make_unique<NullAlgorithm>(*output_for_algorithm),
+        std::make_unique<NullDroneControl>(),
+        std::move(mission),
+        types::SimulationConfigData{},
+        missionConfig(),
+        types::ResolutionRequestStatus::Accepted,
+        output_map_file,
+    };
+
+    const types::SimulationResult result = run.run();
+    const bool log_exists = std::filesystem::exists(error_log);
+    const std::string log_contents = log_exists ? readTextFile(error_log) : std::string{};
+    std::filesystem::remove_all(temporary);
+
+    EXPECT_TRUE(mission_ptr->called);
+    EXPECT_DOUBLE_EQ(result.mission_score, -1.0);
+    EXPECT_EQ(result.mission_results.size(), 1U);
+    ASSERT_FALSE(result.mission_results.empty());
+    EXPECT_EQ(result.mission_results.front().status, types::MissionRunStatus::Error);
+    EXPECT_EQ(result.mission_results.front().steps, 1U);
+    const types::MissionRunResult& error_result = result.mission_results.back();
+    EXPECT_EQ(error_result.status, types::MissionRunStatus::Error);
+    EXPECT_EQ(error_result.steps, 1U);
+    ASSERT_EQ(error_result.errors.size(), 1U);
+    EXPECT_EQ(error_result.errors.front().code, "SIMULATION_RUN_ERROR");
+    EXPECT_EQ(error_result.errors.front().message, "deterministic comparison failure");
+    EXPECT_TRUE(log_exists);
+    EXPECT_THAT(
+        log_contents,
+        testing::HasSubstr(
+            "step=0 code=SIMULATION_RUN_ERROR message=\"deterministic comparison failure\""));
 }
 
 TEST(SimulationRun, ScoresOnlyTheSharedOutputMissionDomain) {

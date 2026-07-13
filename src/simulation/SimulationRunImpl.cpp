@@ -2,11 +2,33 @@
 
 #include <drone_mapper/MapsComparison.h>
 
+#include <fstream>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 namespace drone_mapper {
+namespace {
+
+void appendErrorLog(const std::filesystem::path& log_path, const types::ErrorRef& error) {
+    if (log_path.has_parent_path()) {
+        std::error_code directory_error;
+        std::filesystem::create_directories(log_path.parent_path(), directory_error);
+        if (directory_error) {
+            return;
+        }
+    }
+
+    std::ofstream log{log_path, std::ios::app};
+    if (log) {
+        log << "step=0 code=" << error.code
+            << " message=\"" << error.message << "\"\n";
+        log.flush();
+    }
+}
+
+} // namespace
 
 SimulationRunImpl::SimulationRunImpl(std::unique_ptr<const IMap3D> hidden_map,
                                      std::unique_ptr<IMutableMap3D> output_map,
@@ -61,10 +83,15 @@ types::SimulationResult SimulationRunImpl::run() {
             result.mission_score = scores.empty() ? -1.0 : scores.front();
         }
     } catch (const std::exception& error) {
+        const std::size_t completed_steps =
+            result.mission_results.empty() ? 0 : result.mission_results.front().steps;
+        const types::ErrorRef run_error{"SIMULATION_RUN_ERROR", error.what()};
+        appendErrorLog(output_map_file_.parent_path() / "errors.log", run_error);
+        result.mission_results.clear();
         result.mission_results.push_back(types::MissionRunResult{
             types::MissionRunStatus::Error,
-            0,
-            {types::ErrorRef{"SIMULATION_RUN_ERROR", error.what()}},
+            completed_steps,
+            {run_error},
         });
     }
 
