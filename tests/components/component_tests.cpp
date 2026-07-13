@@ -93,6 +93,35 @@ namespace {
     };
 }
 
+class CountingReadMap final : public IMap3D {
+public:
+    CountingReadMap(const IMap3D& map, double far_x_cm)
+        : map_(map), far_x_cm_(far_x_cm) {}
+
+    types::VoxelOccupancy atVoxel(const Position3D& position) const override {
+        ++at_voxel_calls;
+        if (position.x.force_numerical_value_in(cm) > far_x_cm_) {
+            ++far_voxel_calls;
+        }
+        return map_.atVoxel(position);
+    }
+
+    types::MapConfig getMapConfig() const override {
+        return map_.getMapConfig();
+    }
+
+    bool isInBounds(const Position3D& position) const override {
+        return map_.isInBounds(position);
+    }
+
+    mutable std::size_t at_voxel_calls = 0;
+    mutable std::size_t far_voxel_calls = 0;
+
+private:
+    const IMap3D& map_;
+    double far_x_cm_ = 0.0;
+};
+
 class StaticRun final : public ISimulationRun {
 public:
     explicit StaticRun(double score) : score_(score) {}
@@ -953,6 +982,32 @@ TEST(MappingAlgorithm, TraversesNonActionableCellTowardActionableCoverageTarget)
         types::DroneState{pos(12.5, 2.5, 2.5), makeHeading(0.0), 2}, nullptr);
     EXPECT_TRUE(destination_command.scan_orientation.has_value());
     EXPECT_EQ(destination_command.status, types::AlgorithmStatus::Working);
+}
+
+TEST(MappingAlgorithm, ActionabilityExistenceQueryFindsUsefulBaseScanWithoutFullRanking) {
+    const types::MappingBounds mission_bounds = bounds(0.0, 70.0, 0.0, 25.0, 0.0, 25.0);
+    const types::MapConfig config = mapConfig(mission_bounds, 5.0);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Occupied);
+    const Position3D current_position = pos(12.5, 12.5, 12.5);
+    const Position3D next_position = pos(17.5, 12.5, 12.5);
+    output->set(current_position, types::VoxelOccupancy::Empty);
+    output->set(next_position, types::VoxelOccupancy::Empty);
+    for (double x = 22.5; x < 70.0; x += 5.0) {
+        output->set(pos(x, 12.5, 12.5), types::VoxelOccupancy::Unmapped);
+    }
+
+    const types::MissionConfigData mission{100, 5.0 * cm, 1.0, mission_bounds};
+    const types::LidarConfigData lidar{5.0 * cm, 50.0 * cm, 2.0 * cm, 1};
+    CountingReadMap counting_map{*output, 30.0};
+    MappingAlgorithmImpl algorithm{mission, lidar, droneConfig(), counting_map};
+
+    const types::MappingStepCommand command = algorithm.nextStep(
+        types::DroneState{current_position, makeHeading(0.0), 0}, nullptr);
+
+    ASSERT_TRUE(command.movement.has_value());
+    EXPECT_EQ(command.movement->type, types::MovementCommandType::Advance);
+    EXPECT_EQ(command.status, types::AlgorithmStatus::Working);
+    EXPECT_EQ(counting_map.far_voxel_calls, 0U);
 }
 
 TEST(MappingAlgorithm, SkipsBaseDirectionsWithoutUsefulPotential) {

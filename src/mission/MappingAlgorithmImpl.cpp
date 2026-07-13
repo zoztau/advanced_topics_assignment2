@@ -84,6 +84,21 @@ constexpr double kMinimumUsefulPotentialFraction = 0.05;
     return MappingAlgorithmImpl::Direction{direction.dy, -direction.dx, 0};
 }
 
+[[nodiscard]] std::array<MappingAlgorithmImpl::Direction, 6> baseScanDirections(
+    Orientation heading) {
+    const MappingAlgorithmImpl::Direction forward = horizontalDirection(heading);
+    const MappingAlgorithmImpl::Direction left = leftOf(forward);
+    const MappingAlgorithmImpl::Direction right = rightOf(forward);
+    return {
+        forward,
+        left,
+        right,
+        MappingAlgorithmImpl::Direction{-forward.dx, -forward.dy, 0},
+        MappingAlgorithmImpl::Direction{0, 0, 1},
+        MappingAlgorithmImpl::Direction{0, 0, -1},
+    };
+}
+
 [[nodiscard]] std::size_t beamsOnCircle(std::size_t circle_index) {
     std::size_t count = 1;
     for (std::size_t circle = 0; circle < circle_index; ++circle) {
@@ -429,7 +444,8 @@ double MappingAlgorithmImpl::clearanceScore(const GridIndex& index) const {
 }
 
 double MappingAlgorithmImpl::scanPotentialScore(const Position3D& origin,
-                                                const Direction& direction) const {
+                                                const Direction& direction,
+                                                std::optional<double> sufficient_score) const {
     if (direction.dx == 0 && direction.dy == 0 && direction.dz == 0) {
         return 0.0;
     }
@@ -485,15 +501,27 @@ double MappingAlgorithmImpl::scanPotentialScore(const Position3D& origin,
             const double cell_distance = distance / resolution;
             const double distance_weight =
                 1.0 / (1.0 + kScanDistanceWeightDecay * cell_distance);
+            double contribution = 0.0;
             if (occupancy == types::VoxelOccupancy::Unmapped) {
-                score += distance_weight;
+                contribution = distance_weight;
             } else if (occupancy == types::VoxelOccupancy::PotentiallyOccupied) {
-                score += 0.35 * distance_weight;
+                contribution = 0.35 * distance_weight;
+            }
+
+            // distance_weight is positive and each occupancy multiplier is
+            // nonnegative, so later samples can never reduce the score.
+            score += contribution;
+            if (sufficient_score.has_value() &&
+                score + kEpsilon >= *sufficient_score) {
+                return true;
             }
         }
+        return false;
     };
 
-    score_beam(center_horizontal, center_altitude);
+    if (score_beam(center_horizontal, center_altitude)) {
+        return score;
+    }
     for (std::size_t circle = 1; circle < lidar_config_.fov_circles; ++circle) {
         const std::size_t beam_count = beamsOnCircle(circle);
         const double radius = static_cast<double>(circle) * circle_spacing;
@@ -504,8 +532,10 @@ double MappingAlgorithmImpl::scanPotentialScore(const Position3D& origin,
             const double altitude_offset = radius * std::sin(theta);
             const double horizontal_delta = std::atan2(horizontal_offset, z_min);
             const double altitude_delta = std::atan2(altitude_offset, z_min);
-            score_beam(center_horizontal + horizontal_delta,
-                       center_altitude + altitude_delta);
+            if (score_beam(center_horizontal + horizontal_delta,
+                           center_altitude + altitude_delta)) {
+                return score;
+            }
         }
     }
 
@@ -522,6 +552,33 @@ double MappingAlgorithmImpl::minimumUsefulScanPotential() const {
         std::max(1, static_cast<int>(std::ceil(lengthCm(lidar_config_.z_max) / resolution)));
     return kMinimumUsefulPotentialFraction /
            (1.0 + kScanDistanceWeightDecay * static_cast<double>(max_cells));
+}
+
+bool MappingAlgorithmImpl::canPlanScanAtCell(long long key) const {
+    return !((!scanned_cells_.contains(key) && scanned_cells_.size() >= maxScannedCells()) ||
+             lidar_config_.fov_circles == 0 || lengthCm(lidar_config_.z_max) <= 0.0);
+}
+
+std::optional<double> MappingAlgorithmImpl::usefulBaseScanPotential(
+    long long key,
+    const Position3D& origin,
+    const Direction& direction,
+    ScanPotentialMode mode) const {
+    const BaseScanAttempt attempt = std::make_tuple(key, direction.dx, direction.dy, direction.dz);
+    if (attempted_base_scans_.contains(attempt)) {
+        return std::nullopt;
+    }
+
+    const double minimum_potential = minimumUsefulScanPotential();
+    const std::optional<double> sufficient_score =
+        mode == ScanPotentialMode::StopWhenUseful
+            ? std::optional<double>{minimum_potential}
+            : std::nullopt;
+    const double potential = scanPotentialScore(origin, direction, sufficient_score);
+    if (potential + kEpsilon < minimum_potential) {
+        return std::nullopt;
+    }
+    return potential;
 }
 
 bool MappingAlgorithmImpl::isFrontier(const GridIndex& index) const {
@@ -791,35 +848,22 @@ std::optional<MappingAlgorithmImpl::ScanPlan> MappingAlgorithmImpl::nextScanPlan
     const GridIndex& current,
     const types::DroneState& state) const {
     const long long key = flatKey(current);
-    if ((!scanned_cells_.contains(key) && scanned_cells_.size() >= maxScannedCells()) ||
-        lidar_config_.fov_circles == 0 || lengthCm(lidar_config_.z_max) <= 0.0) {
+    if (!canPlanScanAtCell(key)) {
         return std::nullopt;
     }
 
-    const Direction forward = horizontalDirection(state.heading);
-    const Direction left = leftOf(forward);
-    const Direction right = rightOf(forward);
-    const std::array<Direction, 6> base_directions{
-        forward,
-        left,
-        right,
-        Direction{-forward.dx, -forward.dy, 0},
-        Direction{0, 0, 1},
-        Direction{0, 0, -1},
-    };
+    const std::array<Direction, 6> base_directions = baseScanDirections(state.heading);
 
     // Rebuild priorities from the updated map and issue only the best scan.
     std::vector<std::pair<Direction, double>> useful_base_directions;
-    const double minimum_potential = minimumUsefulScanPotential();
     for (const Direction& direction : base_directions) {
-        const auto attempt = std::make_tuple(key, direction.dx, direction.dy, direction.dz);
-        if (attempted_base_scans_.contains(attempt)) {
-            continue;
-        }
-
-        const double potential = scanPotentialScore(state.position, direction);
-        if (potential + kEpsilon >= minimum_potential) {
-            useful_base_directions.emplace_back(direction, potential);
+        const std::optional<double> potential = usefulBaseScanPotential(
+            key,
+            state.position,
+            direction,
+            ScanPotentialMode::Complete);
+        if (potential.has_value()) {
+            useful_base_directions.emplace_back(direction, *potential);
         }
     }
 
@@ -837,6 +881,26 @@ std::optional<MappingAlgorithmImpl::ScanPlan> MappingAlgorithmImpl::nextScanPlan
         return plan;
     }
 
+    const std::optional<AdaptiveScanCandidate> adaptive_candidate =
+        nextAdaptiveScanCandidateForCell(current, state);
+    if (!adaptive_candidate.has_value()) {
+        return std::nullopt;
+    }
+
+    ScanPlan plan{};
+    plan.orientation = scanOrientationToward(adaptive_candidate->target, state);
+    plan.adaptive_attempt = adaptive_candidate->attempt;
+    plan.next_adaptive_candidate_cursor =
+        adaptive_candidate->next_adaptive_candidate_cursor;
+    return plan;
+}
+
+std::optional<MappingAlgorithmImpl::AdaptiveScanCandidate>
+MappingAlgorithmImpl::nextAdaptiveScanCandidateForCell(
+    const GridIndex& current,
+    const types::DroneState& state) const {
+    const long long key = flatKey(current);
+
     std::size_t adaptive_scan_count = 0;
     if (const auto count = adaptive_scan_counts_.find(key); count != adaptive_scan_counts_.end()) {
         adaptive_scan_count = count->second;
@@ -846,14 +910,7 @@ std::optional<MappingAlgorithmImpl::ScanPlan> MappingAlgorithmImpl::nextScanPlan
         return std::nullopt;
     }
 
-    const std::array<Direction, 6> candidate_directions{
-        forward,
-        left,
-        right,
-        Direction{-forward.dx, -forward.dy, 0},
-        Direction{0, 0, 1},
-        Direction{0, 0, -1},
-    };
+    const std::array<Direction, 6> candidate_directions = baseScanDirections(state.heading);
     const types::MapConfig config = output_map_.getMapConfig();
     const double lidar_range = lengthCm(lidar_config_.z_max);
     const double lidar_range_squared = lidar_range * lidar_range;
@@ -904,14 +961,16 @@ std::optional<MappingAlgorithmImpl::ScanPlan> MappingAlgorithmImpl::nextScanPlan
                 continue;
             }
 
-            ScanPlan plan{};
-            plan.orientation = scanOrientationToward(target, state);
-            plan.adaptive_attempt = attempt;
-            plan.next_adaptive_candidate_cursor =
-                (candidate_index + 1U) % candidate_directions.size();
-            return plan;
+            return AdaptiveScanCandidate{
+                target,
+                attempt,
+                (candidate_index + 1U) % candidate_directions.size(),
+            };
         }
     }
+
+    std::size_t checked_voxels = 0;
+    std::size_t checked_candidates = 0;
 
     const double resolution = lengthCm(config.resolution);
     if (resolution <= 0.0) {
@@ -956,8 +1015,6 @@ std::optional<MappingAlgorithmImpl::ScanPlan> MappingAlgorithmImpl::nextScanPlan
 
     const int max_target_offset =
         std::max(1, static_cast<int>(std::ceil(lidar_range / resolution)) + 1);
-    std::size_t checked_voxels = 0;
-    std::size_t checked_candidates = 0;
     for (int shell = 1; shell <= max_target_offset; ++shell) {
         for (int dx = -shell; dx <= shell; ++dx) {
             for (int dy = -shell; dy <= shell; ++dy) {
@@ -1012,22 +1069,45 @@ std::optional<MappingAlgorithmImpl::ScanPlan> MappingAlgorithmImpl::nextScanPlan
                     }
                     const auto [ray_x, ray_y, ray_z] = *direction_key;
                     const auto attempt = std::make_tuple(key, ray_x, ray_y, ray_z);
-                    if (attempted_adaptive_rays_.contains(attempt) ||
-                        !targetIsVisible(candidate)) {
+                    if (attempted_adaptive_rays_.contains(attempt)) {
+                        continue;
+                    }
+                    if (!targetIsVisible(candidate)) {
                         continue;
                     }
 
-                    ScanPlan plan{};
-                    plan.orientation = scanOrientationToward(target, state);
-                    plan.adaptive_attempt = attempt;
-                    plan.next_adaptive_candidate_cursor = candidate_cursor;
-                    return plan;
+                    return AdaptiveScanCandidate{
+                        target,
+                        attempt,
+                        candidate_cursor,
+                    };
                 }
             }
         }
     }
 
     return std::nullopt;
+}
+
+bool MappingAlgorithmImpl::hasAnyScanPlanForCell(const GridIndex& current,
+                                                 const types::DroneState& state) const {
+    const long long key = flatKey(current);
+    if (!canPlanScanAtCell(key)) {
+        return false;
+    }
+
+    for (const Direction& direction : baseScanDirections(state.heading)) {
+        if (usefulBaseScanPotential(
+                key,
+                state.position,
+                direction,
+                ScanPotentialMode::StopWhenUseful)
+                .has_value()) {
+            return true;
+        }
+    }
+
+    return nextAdaptiveScanCandidateForCell(current, state).has_value();
 }
 
 bool MappingAlgorithmImpl::hasAvailableMappingAction(const GridIndex& index) const {
@@ -1041,7 +1121,7 @@ bool MappingAlgorithmImpl::hasAvailableMappingAction(const GridIndex& index) con
         Orientation{0.0 * horizontal_angle[deg], 0.0 * altitude_angle[deg]},
         0,
     };
-    return nextScanPlanForCell(index, projected_state).has_value();
+    return hasAnyScanPlanForCell(index, projected_state);
 }
 
 std::optional<Orientation> MappingAlgorithmImpl::takeNextScanForCell(

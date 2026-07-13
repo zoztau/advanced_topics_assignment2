@@ -2,6 +2,7 @@
 
 #include <drone_mapper/IMappingAlgorithm.h>
 
+#include <array>
 #include <cstddef>
 #include <deque>
 #include <map>
@@ -51,6 +52,17 @@ private:
         std::size_t next_adaptive_candidate_cursor = 0;
     };
 
+    struct AdaptiveScanCandidate {
+        Position3D target{};
+        AdaptiveScanAttempt attempt{};
+        std::size_t next_adaptive_candidate_cursor = 0;
+    };
+
+    enum class ScanPotentialMode {
+        Complete,
+        StopWhenUseful,
+    };
+
     [[nodiscard]] bool usesLeanScanPattern() const;
     [[nodiscard]] std::size_t maxScannedCells() const;
     [[nodiscard]] types::MappingStepCommand finishedCommand() const;
@@ -73,8 +85,15 @@ private:
     [[nodiscard]] double coverageScore(const GridIndex& index) const;
     [[nodiscard]] double clearanceScore(const GridIndex& index) const;
     [[nodiscard]] double scanPotentialScore(const Position3D& origin,
-                                            const Direction& direction) const;
+                                            const Direction& direction,
+                                            std::optional<double> sufficient_score = std::nullopt) const;
     [[nodiscard]] double minimumUsefulScanPotential() const;
+    [[nodiscard]] bool canPlanScanAtCell(long long key) const;
+    [[nodiscard]] std::optional<double> usefulBaseScanPotential(
+        long long key,
+        const Position3D& origin,
+        const Direction& direction,
+        ScanPotentialMode mode) const;
     [[nodiscard]] bool isFrontier(const GridIndex& index) const;
     [[nodiscard]] std::vector<GridIndex> neighbors(const GridIndex& index) const;
     [[nodiscard]] std::optional<GridIndex> chooseLocalMove(const GridIndex& current,
@@ -88,6 +107,11 @@ private:
     [[nodiscard]] std::optional<ScanPlan> nextScanPlanForCell(
         const GridIndex& current,
         const types::DroneState& state) const;
+    [[nodiscard]] std::optional<AdaptiveScanCandidate> nextAdaptiveScanCandidateForCell(
+        const GridIndex& current,
+        const types::DroneState& state) const;
+    [[nodiscard]] bool hasAnyScanPlanForCell(const GridIndex& current,
+                                             const types::DroneState& state) const;
     [[nodiscard]] bool hasAvailableMappingAction(const GridIndex& index) const;
     [[nodiscard]] std::optional<Orientation> takeNextScanForCell(
         const GridIndex& current,
