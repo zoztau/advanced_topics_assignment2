@@ -107,6 +107,7 @@ public:
     }
 
     types::MapConfig getMapConfig() const override {
+        ++get_map_config_calls;
         return map_.getMapConfig();
     }
 
@@ -116,6 +117,7 @@ public:
 
     mutable std::size_t at_voxel_calls = 0;
     mutable std::size_t far_voxel_calls = 0;
+    mutable std::size_t get_map_config_calls = 0;
 
 private:
     const IMap3D& map_;
@@ -1008,6 +1010,34 @@ TEST(MappingAlgorithm, ActionabilityExistenceQueryFindsUsefulBaseScanWithoutFull
     EXPECT_EQ(command.movement->type, types::MovementCommandType::Advance);
     EXPECT_EQ(command.status, types::AlgorithmStatus::Working);
     EXPECT_EQ(counting_map.far_voxel_calls, 0U);
+}
+
+TEST(MappingAlgorithm, ScanPotentialReusesInvariantMapGeometryAcrossOverlappingBeams) {
+    const types::MappingBounds mission_bounds = bounds(0.0, 100.0, 0.0, 55.0, 0.0, 55.0);
+    const types::MapConfig config = mapConfig(mission_bounds, 5.0);
+    auto output = Map3DImpl::createEmpty(config, types::VoxelOccupancy::Occupied);
+    const Position3D current_position = pos(32.5, 27.5, 27.5);
+    output->set(current_position, types::VoxelOccupancy::Empty);
+    for (double x = 37.5; x <= 72.5; x += 5.0) {
+        output->set(pos(x, 27.5, 27.5), types::VoxelOccupancy::Unmapped);
+    }
+
+    const types::MissionConfigData mission{100, 5.0 * cm, 1.0, mission_bounds};
+    const types::LidarConfigData lidar{5.0 * cm, 40.0 * cm, 2.0 * cm, 2};
+    CountingReadMap counting_map{*output, 1000.0};
+    MappingAlgorithmImpl algorithm{mission, lidar, droneConfig(), counting_map};
+
+    const types::MappingStepCommand command = algorithm.nextStep(
+        types::DroneState{current_position, makeHeading(0.0), 0}, nullptr);
+
+    ASSERT_TRUE(command.scan_orientation.has_value());
+    EXPECT_FALSE(command.movement.has_value());
+    EXPECT_EQ(command.status, types::AlgorithmStatus::Working);
+    EXPECT_NEAR(
+        command.scan_orientation->horizontal.force_numerical_value_in(deg), 0.0, 1.0e-6);
+    EXPECT_NEAR(
+        command.scan_orientation->altitude.force_numerical_value_in(deg), 0.0, 1.0e-6);
+    EXPECT_LE(counting_map.get_map_config_calls, 525U);
 }
 
 TEST(MappingAlgorithm, SkipsBaseDirectionsWithoutUsefulPotential) {

@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <map>
 #include <optional>
@@ -87,6 +88,8 @@ private:
     [[nodiscard]] double scanPotentialScore(const Position3D& origin,
                                             const Direction& direction,
                                             std::optional<double> sufficient_score = std::nullopt) const;
+    [[nodiscard]] std::uint32_t beginScanPotentialVisitGeneration(
+        std::size_t voxel_count) const;
     [[nodiscard]] double minimumUsefulScanPotential() const;
     [[nodiscard]] bool canPlanScanAtCell(long long key) const;
     [[nodiscard]] std::optional<double> usefulBaseScanPotential(
@@ -127,6 +130,8 @@ private:
     std::map<long long, std::size_t> adaptive_candidate_cursors_{};
     std::set<long long> visited_cells_{};
     std::set<long long> branch_target_keys_{};
+    mutable std::vector<std::uint32_t> scan_potential_visit_generations_{};
+    mutable std::uint32_t scan_potential_visit_generation_ = 0;
 };
 
 } // namespace drone_mapper

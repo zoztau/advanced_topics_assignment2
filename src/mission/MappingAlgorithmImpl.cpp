@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <optional>
 #include <queue>
@@ -196,6 +197,42 @@ constexpr double kMinimumUsefulPotentialFraction = 0.05;
         dimensionFromSpan(yCm(config.boundaries.min_y), yCm(config.boundaries.max_y), resolution),
         dimensionFromSpan(zCm(config.boundaries.min_height), zCm(config.boundaries.max_height), resolution),
     };
+}
+
+struct DenseGridLayout {
+    std::array<std::size_t, 3> dimensions{};
+    std::size_t yz_stride = 0;
+    std::size_t voxel_count = 0;
+};
+
+[[nodiscard]] std::optional<std::size_t> checkedProduct(std::size_t left,
+                                                        std::size_t right) {
+    if (right != 0 && left > std::numeric_limits<std::size_t>::max() / right) {
+        return std::nullopt;
+    }
+    return left * right;
+}
+
+[[nodiscard]] std::optional<DenseGridLayout> denseGridLayout(
+    const std::array<int, 3>& dimensions) {
+    if (dimensions[0] <= 0 || dimensions[1] <= 0 || dimensions[2] <= 0) {
+        return std::nullopt;
+    }
+
+    const std::array<std::size_t, 3> sizes{
+        static_cast<std::size_t>(dimensions[0]),
+        static_cast<std::size_t>(dimensions[1]),
+        static_cast<std::size_t>(dimensions[2]),
+    };
+    const std::optional<std::size_t> yz_stride = checkedProduct(sizes[1], sizes[2]);
+    if (!yz_stride.has_value()) {
+        return std::nullopt;
+    }
+    const std::optional<std::size_t> voxel_count = checkedProduct(sizes[0], *yz_stride);
+    if (!voxel_count.has_value()) {
+        return std::nullopt;
+    }
+    return DenseGridLayout{sizes, *yz_stride, *voxel_count};
 }
 
 } // namespace
@@ -443,6 +480,26 @@ double MappingAlgorithmImpl::clearanceScore(const GridIndex& index) const {
     return score;
 }
 
+std::uint32_t MappingAlgorithmImpl::beginScanPotentialVisitGeneration(
+    std::size_t voxel_count) const {
+    if (scan_potential_visit_generations_.size() != voxel_count) {
+        scan_potential_visit_generations_.assign(voxel_count, 0);
+        scan_potential_visit_generation_ = 1;
+        return scan_potential_visit_generation_;
+    }
+
+    if (scan_potential_visit_generation_ == std::numeric_limits<std::uint32_t>::max()) {
+        std::fill(scan_potential_visit_generations_.begin(),
+                  scan_potential_visit_generations_.end(),
+                  0);
+        scan_potential_visit_generation_ = 1;
+        return scan_potential_visit_generation_;
+    }
+
+    ++scan_potential_visit_generation_;
+    return scan_potential_visit_generation_;
+}
+
 double MappingAlgorithmImpl::scanPotentialScore(const Position3D& origin,
                                                 const Direction& direction,
                                                 std::optional<double> sufficient_score) const {
@@ -450,7 +507,8 @@ double MappingAlgorithmImpl::scanPotentialScore(const Position3D& origin,
         return 0.0;
     }
 
-    const double resolution = lengthCm(output_map_.getMapConfig().resolution);
+    const types::MapConfig map_config = output_map_.getMapConfig();
+    const double resolution = lengthCm(map_config.resolution);
     if (resolution <= 0.0) {
         return 0.0;
     }
@@ -470,7 +528,56 @@ double MappingAlgorithmImpl::scanPotentialScore(const Position3D& origin,
     const double z_min = lengthCm(lidar_config_.z_min);
     const double circle_spacing = lengthCm(lidar_config_.d);
 
-    std::set<long long> scored_voxels;
+    const std::array<int, 3> dimensions = dimensionsFromConfig(map_config);
+    const double min_x = xCm(map_config.boundaries.min_x);
+    const double min_y = yCm(map_config.boundaries.min_y);
+    const double min_z = zCm(map_config.boundaries.min_height);
+    const auto grid_from_position = [&](const Position3D& position) {
+        return GridIndex{
+            static_cast<int>(std::floor((xCm(position.x) - min_x) / resolution)),
+            static_cast<int>(std::floor((yCm(position.y) - min_y) / resolution)),
+            static_cast<int>(std::floor((zCm(position.z) - min_z) / resolution)),
+        };
+    };
+    const auto in_grid = [&](const GridIndex& index) {
+        return index.x >= 0 && index.y >= 0 && index.z >= 0 &&
+               index.x < dimensions[0] && index.y < dimensions[1] &&
+               index.z < dimensions[2];
+    };
+    const auto cell_center = [&](const GridIndex& index) {
+        return Position3D{
+            (min_x + (static_cast<double>(index.x) + 0.5) * resolution) * x_extent[cm],
+            (min_y + (static_cast<double>(index.y) + 0.5) * resolution) * y_extent[cm],
+            (min_z + (static_cast<double>(index.z) + 0.5) * resolution) * z_extent[cm],
+        };
+    };
+
+    const std::optional<DenseGridLayout> dense_layout = denseGridLayout(dimensions);
+    const std::uint32_t visit_generation = dense_layout.has_value()
+        ? beginScanPotentialVisitGeneration(dense_layout->voxel_count)
+        : 0;
+    std::set<std::tuple<int, int, int>> fallback_scored_voxels;
+    const auto first_voxel_encounter = [&](const GridIndex& index) {
+        if (!dense_layout.has_value()) {
+            return fallback_scored_voxels.emplace(index.x, index.y, index.z).second;
+        }
+
+        const std::size_t dense_key =
+            static_cast<std::size_t>(index.x) * dense_layout->yz_stride +
+            static_cast<std::size_t>(index.y) * dense_layout->dimensions[2] +
+            static_cast<std::size_t>(index.z);
+        if (dense_key >= scan_potential_visit_generations_.size()) {
+            return fallback_scored_voxels.emplace(index.x, index.y, index.z).second;
+        }
+
+        std::uint32_t& marker = scan_potential_visit_generations_[dense_key];
+        if (marker == visit_generation) {
+            return false;
+        }
+        marker = visit_generation;
+        return true;
+    };
+
     double score = 0.0;
     const auto score_beam = [&](double horizontal, double altitude) {
         const double cos_altitude = std::cos(altitude);
@@ -485,16 +592,16 @@ double MappingAlgorithmImpl::scanPotentialScore(const Position3D& origin,
                 origin.y + ray_y * distance * y_extent[cm],
                 origin.z + ray_z * distance * z_extent[cm],
             };
-            const GridIndex sample = gridFromPosition(sample_position);
-            if (!inGrid(sample)) {
+            const GridIndex sample = grid_from_position(sample_position);
+            if (!in_grid(sample)) {
                 break;
             }
 
-            const types::VoxelOccupancy occupancy = output_map_.atVoxel(cellCenter(sample));
+            const types::VoxelOccupancy occupancy = output_map_.atVoxel(cell_center(sample));
             if (occupancy == types::VoxelOccupancy::Occupied) {
                 break;
             }
-            if (!scored_voxels.insert(flatKey(sample)).second) {
+            if (!first_voxel_encounter(sample)) {
                 continue;
             }
 
